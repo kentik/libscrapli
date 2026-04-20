@@ -6,14 +6,14 @@ LIBSCRAPLI_TARGET="${TARGET:-}"
 OUT_NAME="${OUT_NAME:-}"
 
 if [[ -z "$LIBSCRAPLI_TAG" ]]; then
-    git clone --depth 1 https://github.com/scrapli/libscrapli
+    git clone --depth 1 https://github.com/kentik/libscrapli
 
 elif [[ "$LIBSCRAPLI_TAG" =~ ^[0-9a-fA-F]{7,40}$ ]]; then
-    git clone https://github.com/scrapli/libscrapli
+    git clone https://github.com/kentik/libscrapli
     git -C ./libscrapli/ checkout "$LIBSCRAPLI_TAG"
 
 else
-    git clone --branch "$LIBSCRAPLI_TAG" --depth 1 --single-branch https://github.com/scrapli/libscrapli
+    git clone --branch "$LIBSCRAPLI_TAG" --depth 1 --single-branch https://github.com/kentik/libscrapli
 fi
 
 cd libscrapli
