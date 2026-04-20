@@ -1161,12 +1161,10 @@ pub const Transport = struct {
                 0,
             );
 
-            if (errmsg != null and errlen > 0) {
-                const msg_slice = errmsg[0..@intCast(errlen)];
-                std.debug.print("libssh2 error: {} {s}\n", .{ err, msg_slice });
-            } else {
-                std.debug.print("libssh2 error: {} (no message)\n", .{err});
-            }
+            self.log.debug(
+                "ssh2.Transport handlePrivateKeyAuth: libssh2 error code {d}: {?s}",
+                .{ err, if (errmsg != null and errlen > 0) errmsg[0..@intCast(errlen)] else null },
+            );
 
             return errors.wrapWarnError(
                 errors.ScrapliError.Transport,
@@ -1255,12 +1253,10 @@ pub const Transport = struct {
                 0,
             );
 
-            if (errmsg != null and errlen > 0) {
-                const msg_slice = errmsg[0..@intCast(errlen)];
-                std.debug.print("libssh2 error: {} {s}\n", .{ err, msg_slice });
-            } else {
-                std.debug.print("libssh2 error: {} (no message)\n", .{err});
-            }
+            self.log.debug(
+                "ssh2.Transport handlePrivateKeyContentAuth: libssh2 error code {d}: {?s}",
+                .{ err, if (errmsg != null and errlen > 0) errmsg[0..@intCast(errlen)] else null },
+            );
 
             return errors.wrapWarnError(
                 errors.ScrapliError.Transport,
