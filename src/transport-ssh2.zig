@@ -1168,7 +1168,7 @@ pub const Transport = struct {
                 std.debug.print("libssh2 error: {} (no message)\n", .{err});
             }
 
-            return errors.wrapCriticalError(
+            return errors.wrapWarnError(
                 errors.ScrapliError.Transport,
                 @src(),
                 self.log,
@@ -1262,7 +1262,7 @@ pub const Transport = struct {
                 std.debug.print("libssh2 error: {} (no message)\n", .{err});
             }
 
-            return errors.wrapCriticalError(
+            return errors.wrapWarnError(
                 errors.ScrapliError.Transport,
                 @src(),
                 self.log,
