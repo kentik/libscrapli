@@ -8,12 +8,14 @@ const version = std.SemanticVersion{
     .pre = null,
 };
 
+const min_glibc_version: std.SemanticVersion = .{ .major = 2, .minor = 17, .patch = 0 };
+
 const ffi_targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
-    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 17, .patch = 0 } },
+    .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu, .glibc_version = min_glibc_version },
     .{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .musl },
     .{ .cpu_arch = .x86_64, .os_tag = .macos },
-    .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 17, .patch = 0 } },
+    .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .gnu, .glibc_version = min_glibc_version },
     .{ .cpu_arch = .x86_64, .os_tag = .linux, .abi = .musl },
 };
 
