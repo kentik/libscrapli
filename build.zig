@@ -8,7 +8,7 @@ const version = std.SemanticVersion{
     .pre = null,
 };
 
-const min_glibc_version: std.SemanticVersion = .{ .major = 2, .minor = 17, .patch = 0 };
+const min_glibc_version = std.SemanticVersion{ .major = 2, .minor = 17, .patch = 0, .pre = null };
 
 const ffi_targets: []const std.Target.Query = &.{
     .{ .cpu_arch = .aarch64, .os_tag = .macos },
@@ -188,6 +188,7 @@ fn buildZlinter(
                 .{
                     .exclude = &.{
                         b.path(".private/"),
+                        b.path("build.zig"),
                         b.path("main.zig"),
                         b.path("lib/"),
                         b.path("examples/"),
