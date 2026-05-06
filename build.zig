@@ -188,7 +188,6 @@ fn buildZlinter(
                 .{
                     .exclude = &.{
                         b.path(".private/"),
-                        b.path("build.zig"),
                         b.path("main.zig"),
                         b.path("lib/"),
                         b.path("examples/"),
