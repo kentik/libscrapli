@@ -30,6 +30,6 @@ jobs:
             build/
 
       - name: push builder (dev) image to ghcr
-        if: github.repository == 'scrapli/libscrapli'
+        if: github.repository == 'kentik/libscrapli'
         run: |
           docker push ghcr.io/kentik/libscrapli/builder:dev-latest
