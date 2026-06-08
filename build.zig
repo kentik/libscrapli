@@ -57,6 +57,33 @@ fn buildScrapli(
     dependency_linkage: std.builtin.LinkMode,
     is_ffi: bool,
 ) !*std.Build.Module {
+    const pcre2_dep = b.dependency(
+        "pcre2",
+        .{
+            .target = target,
+            .optimize = optimize,
+        },
+    );
+
+    const libssh2_dep = b.dependency(
+        "libssh2",
+        .{
+            .target = target,
+            .optimize = optimize,
+        },
+    );
+
+    const translate_c = b.addTranslateC(
+        .{
+            .root_source_file = b.path("src/c.h"),
+            .target = target,
+            .optimize = optimize,
+        },
+    );
+
+    translate_c.defineCMacro("_XOPEN_SOURCE", "500");
+    translate_c.defineCMacro("PCRE2_CODE_UNIT_WIDTH", "8");
+
     const root_source_file = if (is_ffi) "src/ffi-root.zig" else "src/root.zig";
 
     const scrapli = b.addModule(
@@ -66,6 +93,10 @@ fn buildScrapli(
             .target = target,
             .optimize = optimize,
             .imports = &.{
+                .{
+                    .name = "c",
+                    .module = translate_c.createModule(),
+                },
                 .{
                     .name = "yaml",
                     .module = b.dependency(
@@ -86,6 +117,14 @@ fn buildScrapli(
                         },
                     ).module("xml"),
                 },
+                .{
+                    .name = "pcre2",
+                    .module = pcre2_dep.module("pcre2"),
+                },
+                .{
+                    .name = "ssh2",
+                    .module = libssh2_dep.module("ssh2"),
+                },
             },
             .link_libc = true,
         },
@@ -94,34 +133,13 @@ fn buildScrapli(
     switch (dependency_linkage) {
         .static => {
             scrapli.linkLibrary(
-                b.dependency(
-                    "pcre2",
-                    .{
-                        .target = target,
-                        .optimize = optimize,
-                    },
-                ).artifact("pcre2-8"),
+                pcre2_dep.artifact("pcre2-8"),
             );
             scrapli.linkLibrary(
-                b.dependency(
-                    "libssh2",
-                    .{
-                        .target = target,
-                        .optimize = optimize,
-                    },
-                ).artifact("ssh2"),
+                libssh2_dep.artifact("ssh2"),
             );
         },
         .dynamic => {
-            // always include our patched libssh2 header first, this fixes a translate-c issue
-            // that resulted in a struct having the same field twice which caused the linker to
-            // fail in very confusing ways!
-            scrapli.addIncludePath(
-                .{
-                    .cwd_relative = "./lib/libssh2/include",
-                },
-            );
-
             if (target.result.os.tag == .macos) {
                 if (target.result.cpu.arch == .aarch64) {
                     // arm homebrew paths
@@ -144,6 +162,26 @@ fn buildScrapli(
                     scrapli.addLibraryPath(
                         .{
                             .cwd_relative = "/usr/local/lib",
+                        },
+                    );
+                }
+            } else if (target.result.os.tag == .linux and target.result.abi == .gnu) {
+                scrapli.addIncludePath(
+                    .{
+                        .cwd_relative = "/usr/include",
+                    },
+                );
+
+                if (target.result.cpu.arch == .aarch64) {
+                    scrapli.addLibraryPath(
+                        .{
+                            .cwd_relative = "/usr/lib/aarch64-linux-gnu",
+                        },
+                    );
+                } else if (target.result.cpu.arch == .x86_64) {
+                    scrapli.addLibraryPath(
+                        .{
+                            .cwd_relative = "/usr/lib/x86_64-linux-gnu",
                         },
                     );
                 }
@@ -568,7 +606,11 @@ fn buildFFITarget(
                     .custom = try genFfiLibOutputDir(b, libscrapli),
                 },
             },
-            .dest_sub_path = try genFfiLibOutputName(b, libscrapli),
+            .dest_sub_path = try genFfiLibOutputName(
+                b,
+                libscrapli,
+                dependency_linkage,
+            ),
             .dylib_symlinks = false,
         },
     );
@@ -611,26 +653,33 @@ fn genFfiLibOutputDir(
 fn genFfiLibOutputName(
     b: *std.Build,
     lib: *std.Build.Step.Compile,
+    dependency_linkage: std.builtin.LinkMode,
 ) ![]const u8 {
+    const base_name = switch (dependency_linkage) {
+        .static => "libscrapli",
+        .dynamic => "libscrapli-dynamic",
+    };
+
     switch (lib.rootModuleTarget().os.tag) {
         .macos => {
-            const base_name = try std.fmt.allocPrint(
+            const versioned_name = try std.fmt.allocPrint(
                 b.allocator,
-                "libscrapli.{d}.{d}.{d}",
+                "{s}.{d}.{d}.{d}",
                 .{
+                    base_name,
                     version.major,
                     version.minor,
                     version.patch,
                 },
             );
-            defer b.allocator.free(base_name);
+            defer b.allocator.free(versioned_name);
 
             if (version.pre) |pre| {
                 return std.fmt.allocPrint(
                     b.allocator,
                     "{s}-{s}.dylib",
                     .{
-                        base_name,
+                        versioned_name,
                         pre,
                     },
                 );
@@ -640,15 +689,16 @@ fn genFfiLibOutputName(
                 b.allocator,
                 "{s}.dylib",
                 .{
-                    base_name,
+                    versioned_name,
                 },
             );
         },
         else => {
-            const base_name = try std.fmt.allocPrint(
+            const versioned_name = try std.fmt.allocPrint(
                 b.allocator,
-                "libscrapli.so.{d}.{d}.{d}",
+                "{s}.so.{d}.{d}.{d}",
                 .{
+                    base_name,
                     version.major,
                     version.minor,
                     version.patch,
@@ -656,19 +706,19 @@ fn genFfiLibOutputName(
             );
 
             if (version.pre) |pre| {
-                defer b.allocator.free(base_name);
+                defer b.allocator.free(versioned_name);
 
                 return std.fmt.allocPrint(
                     b.allocator,
                     "{s}-{s}",
                     .{
-                        base_name,
+                        versioned_name,
                         pre,
                     },
                 );
             }
 
-            return base_name;
+            return versioned_name;
         },
     }
 }

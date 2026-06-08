@@ -40,6 +40,10 @@ test {
     _ = transport_ssh2;
     _ = transport_telnet;
 
+    _ = @import("ffi-root.zig");
+    _ = @import("ffi-root-cli.zig");
+    _ = @import("ffi-root-netconf.zig");
+
     comptime {
         _ = @import("tests/integration/driver-tests.zig");
         _ = @import("tests/integration/driver-netconf-tests.zig");

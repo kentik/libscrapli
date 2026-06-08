@@ -4,7 +4,7 @@ const bytes = @import("bytes.zig");
 const re = @import("re.zig");
 
 /// CheckF defines a check function that can be used with the in bytes check functions.
-pub const CheckF = fn (args: CheckArgs, buf: []u8) anyerror!MatchPositions;
+pub const CheckF = *const fn (args: CheckArgs, buf: []const u8) anyerror!MatchPositions;
 
 /// MatchPositions holds the start and end positions of a match in some parent haystack -- it
 /// includes a conveinence function to return the len of the match.
@@ -14,10 +14,6 @@ pub const MatchPositions = struct {
 
     /// Return the total len -- as in the distance between the start and end match positions.
     pub fn len(self: *MatchPositions) usize {
-        if (self.end == 0) {
-            return 0;
-        }
-
         return self.end - self.start;
     }
 };
@@ -48,7 +44,7 @@ pub fn patternInBuf(args: CheckArgs, buf: []const u8) !MatchPositions {
 
     const match_indexes = try re.pcre2FindIndex(args.pattern.?, buf);
     if (!(match_indexes[0] == 0 and match_indexes[1] == 0)) {
-        return MatchPositions{ .start = match_indexes[0], .end = match_indexes[1] - 1 };
+        return MatchPositions{ .start = match_indexes[0], .end = match_indexes[1] };
     }
 
     return MatchPositions{ .start = 0, .end = 0 };
@@ -63,7 +59,7 @@ pub fn anyPatternInBuf(args: CheckArgs, buf: []const u8) !MatchPositions {
     for (args.patterns.?) |pattern| {
         const match_indexes = try re.pcre2FindIndex(pattern.?, buf);
         if (!(match_indexes[0] == 0 and match_indexes[1] == 0)) {
-            return MatchPositions{ .start = match_indexes[0], .end = match_indexes[1] - 1 };
+            return MatchPositions{ .start = match_indexes[0], .end = match_indexes[1] };
         }
     }
 
@@ -80,7 +76,7 @@ pub fn exactInBuf(args: CheckArgs, buf: []const u8) !MatchPositions {
     if (match_start_index != null) {
         return MatchPositions{
             .start = match_start_index.?,
-            .end = match_start_index.? + args.actual.?.len - 1,
+            .end = match_start_index.? + args.actual.?.len,
         };
     }
 
@@ -97,7 +93,7 @@ pub fn fuzzyInBuf(args: CheckArgs, buf: []const u8) !MatchPositions {
         return MatchPositions{ .start = 0, .end = 0 };
     }
 
-    return MatchPositions{ .start = match_indexes[0], .end = match_indexes[1] - 1 };
+    return MatchPositions{ .start = match_indexes[0], .end = match_indexes[1] };
 }
 
 test "patternInBuf" {
@@ -121,7 +117,7 @@ test "patternInBuf" {
             .args = CheckArgs{
                 .pattern = re.pcre2Compile("foo"),
             },
-            .expected = MatchPositions{ .start = 0, .end = 2 },
+            .expected = MatchPositions{ .start = 0, .end = 3 },
         },
         .{
             .name = "simple not from start",
@@ -129,7 +125,7 @@ test "patternInBuf" {
             .args = CheckArgs{
                 .pattern = re.pcre2Compile("foo"),
             },
-            .expected = MatchPositions{ .start = 3, .end = 5 },
+            .expected = MatchPositions{ .start = 3, .end = 6 },
         },
     };
 
@@ -181,7 +177,7 @@ test "anyPatternInBuf" {
                     },
                 ),
             },
-            .expected = MatchPositions{ .start = 0, .end = 2 },
+            .expected = MatchPositions{ .start = 0, .end = 3 },
         },
         .{
             .name = "done last match",
@@ -196,7 +192,7 @@ test "anyPatternInBuf" {
                     },
                 ),
             },
-            .expected = MatchPositions{ .start = 0, .end = 2 },
+            .expected = MatchPositions{ .start = 0, .end = 3 },
         },
     };
 
@@ -241,7 +237,7 @@ test "exactInBuf" {
             .args = CheckArgs{
                 .actual = "foo",
             },
-            .expected = MatchPositions{ .start = 0, .end = 2 },
+            .expected = MatchPositions{ .start = 0, .end = 3 },
         },
         .{
             .name = "simple not from start",
@@ -249,7 +245,7 @@ test "exactInBuf" {
             .args = CheckArgs{
                 .actual = "foo",
             },
-            .expected = MatchPositions{ .start = 3, .end = 5 },
+            .expected = MatchPositions{ .start = 3, .end = 6 },
         },
     };
 
@@ -284,7 +280,7 @@ test "fuzzyInBuf" {
             .args = CheckArgs{
                 .actual = "foo",
             },
-            .expected = MatchPositions{ .start = 0, .end = 8 },
+            .expected = MatchPositions{ .start = 0, .end = 9 },
         },
         .{
             .name = "simple not from start",
@@ -292,7 +288,7 @@ test "fuzzyInBuf" {
             .args = CheckArgs{
                 .actual = "foo",
             },
-            .expected = MatchPositions{ .start = 4, .end = 12 },
+            .expected = MatchPositions{ .start = 4, .end = 13 },
         },
     };
 

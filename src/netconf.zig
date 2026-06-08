@@ -140,6 +140,19 @@ pub const Options = struct {
 
         self.allocator.destroy(self);
     }
+
+    fn validate(self: *Options, log: logging.Logger) !void {
+        switch (self.transport.*) {
+            .bin => {
+                if (self.auth.private_key_content != null) {
+                    // its only a warning, for future things we may want to actually return errors
+                    // here but in this particular case we'll just warn
+                    log.warn("auth private_key_content set, but is ignored for bin transport", .{});
+                }
+            },
+            else => {},
+        }
+    }
 };
 
 /// Driver is the netconf "driver" struct.
@@ -198,6 +211,8 @@ pub const Driver = struct {
         };
 
         logging.traceWithSrc(log, @src(), "netconf.Driver object initializing", .{});
+
+        try opts.validate(log);
 
         switch (opts.transport.*) {
             .bin => {
@@ -486,8 +501,8 @@ pub const Driver = struct {
             std.builtin.AtomicOrder.unordered,
         );
 
-        if (self.process_thread != null) {
-            self.process_thread.?.join();
+        if (self.process_thread) |t| {
+            t.join();
         }
 
         try self.session.close();
@@ -733,17 +748,23 @@ pub const Driver = struct {
             );
         }
 
-        for (self.server_capabilities.?.items) |cap| {
-            if (namespace != null and !std.mem.eql(u8, namespace.?, cap.namespace)) {
-                continue;
+        const server_capabilities = self.server_capabilities.?;
+
+        for (server_capabilities.items) |cap| {
+            if (namespace) |ns| {
+                if (!std.mem.eql(u8, ns, cap.namespace)) {
+                    continue;
+                }
             }
 
             if (!std.mem.eql(u8, name, cap.name)) {
                 continue;
             }
 
-            if (revision != null and !std.mem.eql(u8, revision.?, cap.revision)) {
-                continue;
+            if (revision) |rev| {
+                if (!std.mem.eql(u8, rev, cap.revision)) {
+                    continue;
+                }
             }
 
             return true;
@@ -794,30 +815,26 @@ pub const Driver = struct {
             .version_1_0 => {
                 if (has_version_1_0) {
                     self.negotiated_version = .version_1_0;
-                }
 
-                return errors.wrapCriticalError(
-                    errors.ScrapliError.Driver,
-                    @src(),
-                    self.log,
-                    "netconf.Driver determineVersion: preferred capability unavailable",
-                    .{},
-                );
+                    return;
+                }
             },
             .version_1_1 => {
                 if (has_version_1_1) {
                     self.negotiated_version = .version_1_1;
-                }
 
-                return errors.wrapCriticalError(
-                    errors.ScrapliError.Driver,
-                    @src(),
-                    self.log,
-                    "netconf.Driver determineVersion: preferred capability unavailable",
-                    .{},
-                );
+                    return;
+                }
             },
         }
+
+        return errors.wrapCriticalError(
+            errors.ScrapliError.Driver,
+            @src(),
+            self.log,
+            "netconf.Driver determineVersion: preferred capability unavailable",
+            .{},
+        );
     }
 
     fn sendClientCapabilities(
@@ -1030,7 +1047,13 @@ pub const Driver = struct {
 
             seen_chars += 1;
 
-            if (message_buf.items[reverse_idx] != message_complete_delim[message_complete_delim.len - matched_chars - 1]) {
+            if (message_buf.items[reverse_idx] !=
+                message_complete_delim[
+                    message_complete_delim.len - matched_chars - 1
+                ])
+            {
+                matched_chars = 0;
+
                 continue;
             }
 
@@ -1094,7 +1117,7 @@ pub const Driver = struct {
         var _idx: usize = 0;
         var _id_buf: [10]u8 = undefined;
 
-        for (_start_index.._start_index + 10) |idx| {
+        for (_start_index..@min(message_view.len, _start_index + 10)) |idx| {
             if (!std.ascii.isDigit(message_view[idx])) {
                 break;
             }
@@ -1187,13 +1210,14 @@ pub const Driver = struct {
         var message_start_idx: usize = 0;
 
         while (delimiter_count > 0) {
-            const delimiter_index = std.mem.find(
+            const maybe_delimiter_index = std.mem.find(
                 u8,
                 buf,
                 delimiter_version_1_0,
             );
 
-            const message_view = buf[message_start_idx..delimiter_index.?];
+            const delimiter_index = maybe_delimiter_index.?;
+            const message_view = buf[message_start_idx..delimiter_index];
 
             const owned_raw = try self.allocator.alloc(u8, buf.len);
             @memcpy(owned_raw, buf);
@@ -1204,7 +1228,7 @@ pub const Driver = struct {
             try self.storeMessageOrSubscription(owned_raw, owned_parsed);
 
             delimiter_count -= 1;
-            message_start_idx = delimiter_index.? + delimiter_version_1_0.len + 1;
+            message_start_idx = delimiter_index + delimiter_version_1_0.len + 1;
         }
     }
 
@@ -1421,11 +1445,13 @@ pub const Driver = struct {
         try writer.elementStartNs(base_capability_name, "filter");
         try writer.attribute("type", @tagName(filter_type));
 
-        if (filter_namespace != null and filter_namespace.?.len > 0) {
-            try writer.bindNs(
-                filter_namespace_prefix orelse "",
-                filter_namespace.?,
-            );
+        if (filter_namespace) |ns| {
+            if (ns.len > 0) {
+                try writer.bindNs(
+                    filter_namespace_prefix orelse "",
+                    ns,
+                );
+            }
         }
 
         if (filter_type == operation.FilterType.xpath) {
@@ -1454,20 +1480,24 @@ pub const Driver = struct {
         if (filter_type == operation.FilterType.subtree) {
             try writer.elementStartNs(base_capability_name, "subtree-filter");
 
-            if (filter_namespace != null and filter_namespace.?.len > 0) {
-                try writer.bindNs(
-                    filter_namespace_prefix orelse "",
-                    filter_namespace.?,
-                );
+            if (filter_namespace) |ns| {
+                if (ns.len > 0) {
+                    try writer.bindNs(
+                        filter_namespace_prefix orelse "",
+                        ns,
+                    );
+                }
             }
         } else {
             try writer.elementStartNs(base_capability_name, "xpath-filter");
 
-            if (filter_namespace != null and filter_namespace.?.len > 0) {
-                try writer.bindNs(
-                    filter_namespace_prefix orelse "",
-                    filter_namespace.?,
-                );
+            if (filter_namespace) |ns| {
+                if (ns.len > 0) {
+                    try writer.bindNs(
+                        filter_namespace_prefix orelse "",
+                        ns,
+                    );
+                }
             }
         }
 
@@ -1648,20 +1678,22 @@ pub const Driver = struct {
         try writer.elementStartNs(base_capability_name, "get-config");
         try Driver.addSourceElem(&writer, @tagName(options.source));
 
-        if (options.filter != null and options.filter.?.len > 0) {
-            try Driver.addFilterElem(
-                &writer,
-                options.filter.?,
-                options.filter_type,
-                options.filter_namespace_prefix,
-                options.filter_namespace,
-            );
+        if (options.filter) |filter| {
+            if (filter.len > 0) {
+                try Driver.addFilterElem(
+                    &writer,
+                    filter,
+                    options.filter_type,
+                    options.filter_namespace_prefix,
+                    options.filter_namespace,
+                );
+            }
         }
 
-        if (options.defaults_type != null) {
+        if (options.defaults_type) |defaults_type| {
             try Driver.addDefaultsElem(
                 &writer,
-                options.defaults_type.?,
+                defaults_type,
             );
         }
 
@@ -1975,22 +2007,24 @@ pub const Driver = struct {
         );
         try writer.elementStartNs(base_capability_name, "get");
 
-        if (options.filter != null and options.filter.?.len > 0) {
-            try Driver.addFilterElem(
-                &writer,
-                options.filter.?,
-                options.filter_type,
-                options.filter_namespace_prefix,
-                options.filter_namespace,
-            );
+        if (options.filter) |filter| {
+            if (filter.len > 0) {
+                try Driver.addFilterElem(
+                    &writer,
+                    filter,
+                    options.filter_type,
+                    options.filter_namespace_prefix,
+                    options.filter_namespace,
+                );
+            }
         }
 
         try writer.elementEnd();
 
-        if (options.defaults_type != null) {
+        if (options.defaults_type) |defaults_type| {
             try Driver.addDefaultsElem(
                 &writer,
-                options.defaults_type.?,
+                defaults_type,
             );
         }
 
@@ -2384,10 +2418,12 @@ pub const Driver = struct {
         try writer.text(options.identifier);
         try writer.elementEnd();
 
-        if (options.version != null and options.version.?.len > 0) {
-            try writer.elementStartNs(get_schema_capability_name, "version");
-            try writer.text(options.version.?);
-            try writer.elementEnd();
+        if (options.version) |version| {
+            if (version.len > 0) {
+                try writer.elementStartNs(get_schema_capability_name, "version");
+                try writer.text(version);
+                try writer.elementEnd();
+            }
         }
 
         try writer.elementStartNs(get_schema_capability_name, "format");
@@ -2455,14 +2491,16 @@ pub const Driver = struct {
         ));
         try writer.elementEnd();
 
-        if (options.filter != null and options.filter.?.len > 0) {
-            try Driver.addFilterElemExplicitTag(
-                &writer,
-                options.filter.?,
-                options.filter_type,
-                options.filter_namespace_prefix,
-                options.filter_namespace,
-            );
+        if (options.filter) |filter| {
+            if (filter.len > 0) {
+                try Driver.addFilterElemExplicitTag(
+                    &writer,
+                    filter,
+                    options.filter_type,
+                    options.filter_namespace_prefix,
+                    options.filter_namespace,
+                );
+            }
         }
 
         if (options.config_filter) |cf| {
@@ -2475,30 +2513,32 @@ pub const Driver = struct {
             try writer.elementEnd();
         }
 
-        if (options.origin_filters != null and options.origin_filters.?.len > 0) {
-            try writer.embed(options.origin_filters.?);
+        if (options.origin_filters) |origin_filters| {
+            if (origin_filters.len > 0) {
+                try writer.embed(origin_filters);
+            }
         }
 
-        if (options.max_depth != null) {
+        if (options.max_depth) |max_depth| {
             try writer.elementStart("max-depth");
             var session_id_buf: [20]u8 = undefined;
             try writer.text(try std.fmt.bufPrint(
                 &session_id_buf,
                 "{}",
-                .{options.max_depth.?},
+                .{max_depth},
             ));
             try writer.elementEnd();
         }
 
-        if (options.with_origin != null) {
+        if (options.with_origin) |_| {
             try writer.elementStart("with-origin");
             try writer.elementEnd();
         }
 
-        if (options.defaults_type != null) {
+        if (options.defaults_type) |defaults_type| {
             try Driver.addDefaultsElem(
                 &writer,
-                options.defaults_type.?,
+                defaults_type,
             );
         }
 
@@ -4479,22 +4519,42 @@ test "builActionElem" {
 }
 
 test "processLoopBufContainsCompleteDelim" {
-    var message_buf: std.ArrayList(u8) = .empty;
-    defer message_buf.deinit(std.testing.allocator);
+    const cases = [_]struct {
+        name: []const u8,
+        content: []const u8,
+        read_n: usize,
+        expected: bool,
+    }{
+        .{
+            .name = "simple",
+            .content =
+            \\ <vlan-id>100</vlan-id><config><vlan-id>100</vlan-id><name>ADM</name></config></vlan><vlan><vlan-id>101</vlan-id><config><vlan-id>101</vlan-id><name>BOUCLE_CXR</name></config></vlan><vlan><vlan-id>666</vlan-id><config><vlan-id>666</vlan-id><name>DISCARD</name></config></vlan><vlan><vlan-id>1000</vlan-id><config><vlan-id>1000</vlan-id><name>NATIVE</name></config></vlan></vlans></data></rpc-reply>
+            \\ ##
+            \\
+            ,
+            .read_n = 100,
+            .expected = true,
+        },
+        .{
+            .name = "mismatch before end",
+            .content = "#x#\n",
+            .read_n = 4,
+            .expected = false,
+        },
+    };
 
-    const c =
-        \\ <vlan-id>100</vlan-id><config><vlan-id>100</vlan-id><name>ADM</name></config></vlan><vlan><vlan-id>101</vlan-id><config><vlan-id>101</vlan-id><name>BOUCLE_CXR</name></config></vlan><vlan><vlan-id>666</vlan-id><config><vlan-id>666</vlan-id><name>DISCARD</name></config></vlan><vlan><vlan-id>1000</vlan-id><config><vlan-id>1000</vlan-id><name>NATIVE</name></config></vlan></vlans></data></rpc-reply>
-        \\ ##
-        \\
-    ;
+    for (cases) |case| {
+        var message_buf: std.ArrayList(u8) = .empty;
+        defer message_buf.deinit(std.testing.allocator);
 
-    try message_buf.appendSlice(std.testing.allocator, c);
+        try message_buf.appendSlice(std.testing.allocator, case.content);
 
-    try std.testing.expect(
-        try Driver.processLoopBufContainsCompleteDelim(
-            100,
+        const actual = try Driver.processLoopBufContainsCompleteDelim(
+            case.read_n,
             message_buf,
             delimiter_version_1_1,
-        ),
-    );
+        );
+
+        try std.testing.expectEqual(case.expected, actual);
+    }
 }

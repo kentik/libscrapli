@@ -1,20 +1,13 @@
 const std = @import("std");
 
+const c = @import("c");
+
 const auth = @import("auth.zig");
 const errors = @import("errors.zig");
 const file = @import("file.zig");
 const logging = @import("logging.zig");
 const strings = @import("strings.zig");
 const transport_waiter = @import("transport-waiter.zig");
-
-const c = @cImport(
-    {
-        @cDefine("_XOPEN_SOURCE", "500");
-        @cInclude("stdlib.h");
-        @cInclude("unistd.h");
-        @cInclude("sys/ioctl.h");
-    },
-);
 
 extern fn setsid() callconv(.c) i32;
 
@@ -79,20 +72,20 @@ pub const Options = struct {
             o.bin = try o.allocator.dupe(u8, o.bin);
         }
 
-        if (o.extra_open_args != null) {
-            o.extra_open_args = try o.allocator.dupe(u8, o.extra_open_args.?);
+        if (o.extra_open_args) |extra_open_args| {
+            o.extra_open_args = try o.allocator.dupe(u8, extra_open_args);
         }
 
-        if (o.override_open_args != null) {
-            o.override_open_args = try o.allocator.dupe(u8, o.override_open_args.?);
+        if (o.override_open_args) |override_open_args| {
+            o.override_open_args = try o.allocator.dupe(u8, override_open_args);
         }
 
-        if (o.ssh_config_path != null) {
-            o.ssh_config_path = try o.allocator.dupe(u8, o.ssh_config_path.?);
+        if (o.ssh_config_path) |ssh_config_path| {
+            o.ssh_config_path = try o.allocator.dupe(u8, ssh_config_path);
         }
 
-        if (o.known_hosts_path != null) {
-            o.known_hosts_path = try o.allocator.dupe(u8, o.known_hosts_path.?);
+        if (o.known_hosts_path) |known_hosts_path| {
+            o.known_hosts_path = try o.allocator.dupe(u8, known_hosts_path);
         }
 
         return o;
@@ -104,20 +97,20 @@ pub const Options = struct {
             self.allocator.free(self.bin);
         }
 
-        if (self.extra_open_args != null) {
-            self.allocator.free(self.extra_open_args.?);
+        if (self.extra_open_args) |extra_open_args| {
+            self.allocator.free(extra_open_args);
         }
 
-        if (self.override_open_args != null) {
-            self.allocator.free(self.override_open_args.?);
+        if (self.override_open_args) |override_open_args| {
+            self.allocator.free(override_open_args);
         }
 
-        if (self.ssh_config_path != null) {
-            self.allocator.free(self.ssh_config_path.?);
+        if (self.ssh_config_path) |ssh_config_path| {
+            self.allocator.free(ssh_config_path);
         }
 
-        if (self.known_hosts_path != null) {
-            self.allocator.free(self.known_hosts_path.?);
+        if (self.known_hosts_path) |known_hosts_path| {
+            self.allocator.free(known_hosts_path);
         }
 
         self.allocator.destroy(self);
@@ -133,14 +126,10 @@ pub const Transport = struct {
 
     options: *Options,
     waiter: transport_waiter.Waiter,
+    closing: bool = false,
 
     f: ?std.Io.File = null,
-
-    r_buffer: [1024]u8 = [_]u8{0} ** 1024,
-    reader: ?std.Io.File.Reader = null,
-
-    w_buffer: [1024]u8 = [_]u8{0} ** 1024,
-    writer: ?std.Io.File.Writer = null,
+    fd: ?std.posix.fd_t = null,
 
     open_args: std.ArrayList(strings.MaybeHeapString),
 
@@ -154,6 +143,7 @@ pub const Transport = struct {
         logging.traceWithSrc(log, @src(), "bin.Transport initializing", .{});
 
         const t = try allocator.create(Transport);
+        errdefer allocator.destroy(t);
 
         t.* = Transport{
             .allocator = allocator,
@@ -188,10 +178,10 @@ pub const Transport = struct {
         auth_options: *auth.Options,
         operation_timeout_ns: u64,
     ) !void {
-        if (self.options.override_open_args != null) {
+        if (self.options.override_open_args) |override_open_args| {
             var override_args_iterator = std.mem.splitSequence(
                 u8,
-                self.options.override_open_args.?,
+                override_open_args,
                 " ",
             );
 
@@ -210,7 +200,6 @@ pub const Transport = struct {
 
         try self.open_args.append(
             self.allocator,
-            // TODO -- equivalent of go exec.LookPath
             strings.MaybeHeapString{
                 .allocator = null,
                 .string = self.options.bin,
@@ -287,7 +276,7 @@ pub const Transport = struct {
             );
         }
 
-        if (auth_options.username != null) {
+        if (auth_options.username) |username| {
             try self.open_args.append(
                 self.allocator,
                 strings.MaybeHeapString{
@@ -300,12 +289,12 @@ pub const Transport = struct {
                 self.allocator,
                 strings.MaybeHeapString{
                     .allocator = null,
-                    .string = auth_options.username.?,
+                    .string = username,
                 },
             );
         }
 
-        if (auth_options.private_key_path != null) {
+        if (auth_options.private_key_path) |private_key_path| {
             try self.open_args.append(
                 self.allocator,
                 strings.MaybeHeapString{
@@ -318,12 +307,12 @@ pub const Transport = struct {
                 self.allocator,
                 strings.MaybeHeapString{
                     .allocator = null,
-                    .string = auth_options.private_key_path.?,
+                    .string = private_key_path,
                 },
             );
         }
 
-        if (self.options.ssh_config_path != null) {
+        if (self.options.ssh_config_path) |ssh_config_path| {
             try self.open_args.append(
                 self.allocator,
                 strings.MaybeHeapString{
@@ -336,7 +325,7 @@ pub const Transport = struct {
                 self.allocator,
                 strings.MaybeHeapString{
                     .allocator = null,
-                    .string = self.options.ssh_config_path.?,
+                    .string = ssh_config_path,
                 },
             );
         }
@@ -384,7 +373,7 @@ pub const Transport = struct {
             );
         }
 
-        if (self.options.known_hosts_path != null) {
+        if (self.options.known_hosts_path) |known_hosts_path| {
             try self.open_args.append(
                 self.allocator,
                 strings.MaybeHeapString{
@@ -400,27 +389,29 @@ pub const Transport = struct {
                     .string = try std.fmt.allocPrint(
                         self.allocator,
                         "UserKnownHostsFile={s}",
-                        .{self.options.known_hosts_path.?},
+                        .{known_hosts_path},
                     ),
                 },
             );
         }
 
-        if (self.options.extra_open_args != null and self.options.extra_open_args.?.len > 0) {
-            var extra_args_iterator = std.mem.splitSequence(
-                u8,
-                self.options.extra_open_args.?,
-                " ",
-            );
-
-            while (extra_args_iterator.next()) |arg| {
-                try self.open_args.append(
-                    self.allocator,
-                    strings.MaybeHeapString{
-                        .allocator = null,
-                        .string = arg,
-                    },
+        if (self.options.extra_open_args) |extra_open_args| {
+            if (extra_open_args.len > 0) {
+                var extra_args_iterator = std.mem.splitSequence(
+                    u8,
+                    extra_open_args,
+                    " ",
                 );
+
+                while (extra_args_iterator.next()) |arg| {
+                    try self.open_args.append(
+                        self.allocator,
+                        strings.MaybeHeapString{
+                            .allocator = null,
+                            .string = arg,
+                        },
+                    );
+                }
             }
         }
 
@@ -485,26 +476,28 @@ pub const Transport = struct {
             );
         };
 
-        self.reader = self.f.?.reader(self.io, &self.r_buffer);
-        self.writer = self.f.?.writer(self.io, &self.w_buffer);
+        if (self.f) |f| {
+            self.fd = f.handle;
+        }
     }
 
     /// Closes the transport.
     pub fn close(self: *Transport) void {
         self.log.info("bin.Transport close requested", .{});
 
-        if (self.f != null) {
-            self.f.?.close(self.io);
+        if (self.f) |f| {
+            f.close(self.io);
         }
 
         self.f = null;
+        self.fd = null;
     }
 
     /// Writes content to the transport session.
     pub fn write(self: *Transport, buf: []const u8) !void {
         self.log.debug("bin.Transport write requested", .{});
 
-        if (self.writer == null) {
+        if (self.fd == null) {
             return errors.wrapCriticalError(
                 errors.ScrapliError.Transport,
                 @src(),
@@ -514,24 +507,40 @@ pub const Transport = struct {
             );
         }
 
-        _ = self.writer.?.interface.write(buf) catch |err| {
-            return errors.wrapCriticalError(
-                err,
-                @src(),
-                self.log,
-                "bin.Transport write: writing to pty failed",
-                .{},
+        var written: usize = 0;
+        while (written < buf.len) {
+            const rc = std.posix.system.write(
+                self.fd.?,
+                buf[written..].ptr,
+                buf[written..].len,
             );
-        };
-
-        try self.writer.?.interface.flush();
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => written += @intCast(rc),
+                std.posix.E.AGAIN => return errors.wrapCriticalError(
+                    errors.ScrapliError.Transport,
+                    @src(),
+                    self.log,
+                    "bin.Transport write: eagain on write, short write",
+                    .{},
+                ),
+                else => |err| {
+                    return errors.wrapCriticalError(
+                        std.posix.unexpectedErrno(err),
+                        @src(),
+                        self.log,
+                        "bin.Transport write: writing to fd failed",
+                        .{},
+                    );
+                },
+            }
+        }
     }
 
     /// Reads content from the transport session.
     pub fn read(self: *Transport, buf: []u8) !usize {
         self.log.trace("bin.Transport read requested", .{});
 
-        if (self.reader == null) {
+        if (self.fd == null) {
             return errors.wrapCriticalError(
                 errors.ScrapliError.Transport,
                 @src(),
@@ -541,25 +550,18 @@ pub const Transport = struct {
             );
         }
 
-        const ri = &self.reader.?.interface;
+        try self.waiter.wait(self.fd.?);
 
-        try self.waiter.wait(self.f.?.handle);
+        if (self.closing) {
+            return 0;
+        }
 
-        // i think because this is not a "stream" (like telnet transport) we actually need to call
-        // this in order to get things off the pty and into the intermediate buffer. we know that
-        // there will be *something* to fill because of our waiter, so that should be good...
-        try ri.fillMore();
-
-        var w: std.Io.Writer = .fixed(buf);
-
-        const n = ri.stream(&w, .unlimited) catch |err| {
-            // a warning as this can happen during close so we dont necessarily want to
-            // log a crit
+        const n = std.posix.read(self.fd.?, buf) catch |err| {
             return errors.wrapWarnError(
                 err,
                 @src(),
                 self.log,
-                "bin.Transport read: failed reading from pty",
+                "bin.Transport read: failed reading from fd",
                 .{},
             );
         };
@@ -567,9 +569,11 @@ pub const Transport = struct {
         return n;
     }
 
-    /// Unblocks any in progress reads.
-    pub fn unblock(self: *Transport) !void {
+    /// Unblocks any in progress reads and sets the prepare close flag, this prevents us from
+    /// making a final read the fd that we are about to nuke.
+    pub fn prepareClose(self: *Transport) !void {
         try self.waiter.unblock();
+        self.closing = true;
     }
 };
 
@@ -612,25 +616,33 @@ fn openPty(
     if (pid < 0) {
         return error.PtyError;
     } else if (pid == 0) {
-        const args = try allocator.alloc([*c]u8, open_args.len + 1);
+        const args = allocator.alloc([*c]u8, open_args.len + 1) catch {
+            c._exit(1);
+        };
         defer allocator.free(args);
 
         for (open_args, 0..) |arg, i| {
-            args[i] = try allocator.dupeSentinel(u8, arg, 0);
+            args[i] = allocator.dupeSentinel(u8, arg, 0) catch {
+                c._exit(1);
+            };
         }
 
         args[open_args.len] = null;
 
         // if things fail it will be a little annoying but we'll just have to read the stdout/stderr
         // to see what happened
-        try openPtyChild(
+        openPtyChild(
             master_fd,
             slave_fd,
             @ptrCast(args.ptr),
             term_width,
             term_height,
             netconf,
-        );
+        ) catch {
+            c._exit(1);
+        };
+
+        unreachable;
     }
 
     // parent process, close the slave and return the master (pty) to read/write to
@@ -665,6 +677,8 @@ fn openPtyChild(
         return error.PtyError;
     }
 
+    try setonlcr(slave_fd.handle);
+
     if (!netconf) {
         var ws = c.winsize{
             .ws_row = term_height,
@@ -696,8 +710,7 @@ fn openPtyChild(
 
     const rc = c.execvp(args[0], args);
     if (rc != 0) {
-        // zlinter-disable-next-line no_panic - will catch it from parent if we fail anyway
-        @panic("exec failed");
+        c._exit(1);
     }
 }
 

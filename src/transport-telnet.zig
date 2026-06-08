@@ -60,16 +60,14 @@ pub const Transport = struct {
     log: logging.Logger,
 
     options: *Options,
+
     waiter: transport_waiter.Waiter,
+    closing: bool = false,
 
-    stream: ?std.Io.net.Stream,
+    stream: ?std.Io.net.Stream = null,
+    socket: ?std.posix.socket_t = null,
+
     initial_buf: std.ArrayList(u8),
-
-    r_buffer: [1024]u8 = [_]u8{0} ** 1024,
-    reader: ?std.Io.net.Stream.Reader = null,
-
-    w_buffer: [1024]u8 = [_]u8{0} ** 1024,
-    writer: ?std.Io.net.Stream.Writer = null,
 
     /// Initialize the transport object.
     pub fn init(
@@ -81,6 +79,7 @@ pub const Transport = struct {
         logging.traceWithSrc(log, @src(), "telnet.Transport initializing", .{});
 
         const t = try allocator.create(Transport);
+        errdefer allocator.destroy(t);
 
         t.* = Transport{
             .allocator = allocator,
@@ -88,7 +87,6 @@ pub const Transport = struct {
             .log = log,
             .options = options,
             .waiter = try transport_waiter.Waiter.init(allocator),
-            .stream = null,
             .initial_buf = .empty,
         };
 
@@ -199,19 +197,18 @@ pub const Transport = struct {
 
             var control_char_buf: [1]u8 = undefined;
 
-            const ri = &self.reader.?.interface;
+            try self.waiter.wait(self.socket.?);
 
-            var w: std.Io.Writer = .fixed(&control_char_buf);
-
-            // only wait if the internal reader buffer is zero *or* the internal buffer seek is less
-            // than the end position of the internal buffer -- meaning there is *not* stuff to read
-            // on the internal buffer
-            if (ri.end == 0 or (ri.seek >= ri.end)) {
-                try self.waiter.wait(self.stream.?.socket.handle);
+            const n = try std.posix.read(self.socket.?, &control_char_buf);
+            if (n == 0) {
+                return errors.wrapCriticalError(
+                    errors.ScrapliError.Transport,
+                    @src(),
+                    self.log,
+                    "telnet.Transport handleControlChars: peer closed connection during telnet negotiation",
+                    .{},
+                );
             }
-
-            try ri.streamExact(&w, 1);
-
             const done = try self.handleControlCharResponse(
                 &control_buf,
                 control_char_buf[0],
@@ -234,18 +231,20 @@ pub const Transport = struct {
     ) !void {
         self.log.info("telnet.Transport open requested", .{});
 
-        self.stream = transport_socket.getStream(self.io, host, port) catch {
+        self.stream = transport_socket.getStream(self.io, self.log, host, port) catch {
             return errors.wrapCriticalError(
                 errors.ScrapliError.Transport,
                 @src(),
                 self.log,
-                "ssh2.Transport initSocket: failed initializing socket, " ++
-                    "unable to resolve host",
-                .{},
+                "telnet.Transport initSocket: failed initializing socket, " ++
+                    "unable to resolve host '{s}'",
+                .{host},
             );
         };
 
-        file.setNonBlocking(self.stream.?.socket.handle) catch {
+        self.socket = self.stream.?.socket.handle;
+
+        file.setNonBlocking(self.socket.?) catch {
             return errors.wrapCriticalError(
                 errors.ScrapliError.Transport,
                 @src(),
@@ -254,9 +253,6 @@ pub const Transport = struct {
                 .{},
             );
         };
-
-        self.reader = self.stream.?.reader(self.io, &self.r_buffer);
-        self.writer = self.stream.?.writer(self.io, &self.w_buffer);
 
         try self.handleControlChars(
             start_time,
@@ -269,9 +265,10 @@ pub const Transport = struct {
     pub fn close(self: *Transport) void {
         self.log.info("telnet.Transport close requested", .{});
 
-        if (self.stream != null) {
-            self.stream.?.close(self.io);
+        if (self.stream) |stream| {
+            stream.close(self.io);
             self.stream = null;
+            self.socket = null;
         }
     }
 
@@ -279,7 +276,7 @@ pub const Transport = struct {
     pub fn write(self: *Transport, buf: []const u8) !void {
         self.log.debug("telnet.Transport write requested", .{});
 
-        if (self.stream == null) {
+        if (self.socket == null) {
             return errors.wrapCriticalError(
                 errors.ScrapliError.Transport,
                 @src(),
@@ -289,25 +286,42 @@ pub const Transport = struct {
             );
         }
 
-        _ = self.writer.?.interface.write(buf) catch |err| {
-            return errors.wrapCriticalError(
-                err,
-                @src(),
-                self.log,
-                "bin.Transport write: writing to stream failed",
-                .{},
+        var written: usize = 0;
+        while (written < buf.len) {
+            const rc = std.posix.system.write(
+                self.socket.?,
+                buf[written..].ptr,
+                buf[written..].len,
             );
-        };
-
-        const wi = &self.writer.?.interface;
-        try wi.flush();
+            switch (std.posix.errno(rc)) {
+                .SUCCESS => written += @intCast(rc),
+                std.posix.E.AGAIN => {
+                    return errors.wrapCriticalError(
+                        errors.ScrapliError.Transport,
+                        @src(),
+                        self.log,
+                        "telnet.Transport write: eagain on write, short write",
+                        .{},
+                    );
+                },
+                else => |err| {
+                    return errors.wrapCriticalError(
+                        std.posix.unexpectedErrno(err),
+                        @src(),
+                        self.log,
+                        "telnet.Transport write: writing to stream failed",
+                        .{},
+                    );
+                },
+            }
+        }
     }
 
     /// Read from the transport object.
     pub fn read(self: *Transport, buf: []u8) !usize {
         self.log.trace("telnet.Transport read requested", .{});
 
-        if (self.stream == null) {
+        if (self.socket == null) {
             return errors.wrapCriticalError(
                 errors.ScrapliError.Transport,
                 @src(),
@@ -318,30 +332,26 @@ pub const Transport = struct {
         }
 
         if (self.initial_buf.items.len > 0) {
-            // drain the initial buf if it exists -- this would be any leftover chars we over-read
-            // from the control char handling
             const n = @min(self.initial_buf.items.len, buf.len);
-
             @memcpy(buf[0..n], self.initial_buf.items[0..n]);
-            _ = self.initial_buf.orderedRemove(n - 1);
+
+            try self.initial_buf.replaceRange(
+                self.allocator,
+                0,
+                n,
+                "",
+            );
 
             return n;
         }
 
-        const ri = &self.reader.?.interface;
+        try self.waiter.wait(self.socket.?);
 
-        // only wait if the internal reader buffer is zero *or* the internal buffer seek is less
-        // than the end position of the internal buffer -- meaning there is *not* stuff to read
-        // on the internal buffer
-        if (ri.end == 0 or (ri.seek >= ri.end)) {
-            try self.waiter.wait(self.stream.?.socket.handle);
+        if (self.closing) {
+            return 0;
         }
 
-        var w: std.Io.Writer = .fixed(buf);
-
-        const n = ri.stream(&w, .unlimited) catch |err| {
-            // a warning as this can happen during close so we dont necessarily want to
-            // log a crit
+        const n = std.posix.read(self.socket.?, buf) catch |err| {
             return errors.wrapWarnError(
                 err,
                 @src(),
@@ -354,8 +364,9 @@ pub const Transport = struct {
         return n;
     }
 
-    /// Unblock any in flight reads.
-    pub fn unblock(self: *Transport) !void {
+    /// Unblocks any in progress reads and sets the prepare close flag, this prevents us from
+    /// making a final read the fd that we are about to nuke.
+    pub fn prepareClose(self: *Transport) !void {
         try self.waiter.unblock();
     }
 };

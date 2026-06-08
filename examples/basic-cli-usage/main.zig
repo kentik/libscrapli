@@ -125,11 +125,14 @@ pub fn main(init: std.process.Init) !void {
     );
     defer open_result.deinit();
 
+    const open_result_output = try open_result.getResult(allocator, .{});
+    defer allocator.free(open_result_output);
+
     std.debug.print(
         "{s}\n{s}\n{s}\n Completed in {d}s\n",
         .{
             banner,
-            open_result.results.items[0],
+            open_result_output,
             banner,
             open_result.elapsedTimeSeconds(),
         },
@@ -143,11 +146,14 @@ pub fn main(init: std.process.Init) !void {
     );
     defer send_input_result.deinit();
 
+    const send_input_result_output = try send_input_result.getResult(allocator, .{});
+    defer allocator.free(send_input_result_output);
+
     std.debug.print(
         "{s}\n{s}\n{s}\n Completed in {d}s\n",
         .{
             banner,
-            send_input_result.results.items[0],
+            send_input_result_output,
             banner,
             send_input_result.elapsedTimeSeconds(),
         },
