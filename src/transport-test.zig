@@ -47,10 +47,7 @@ pub const Transport = struct {
 
     options: *Options,
 
-    // we do a zillion reads, but w/e having the intermediate buffer be 1 seems to be marginally
-    // faster than having it be bigger for some reason
-    r_buffer: [1]u8 = [_]u8{0} ** 1,
-    reader: ?std.Io.File.Reader,
+    fd: ?std.posix.fd_t = null,
 
     /// Initialize the transport object.
     pub fn init(
@@ -64,7 +61,7 @@ pub const Transport = struct {
             .allocator = allocator,
             .io = io,
             .options = options,
-            .reader = null,
+            .fd = null,
         };
 
         return t;
@@ -85,13 +82,14 @@ pub const Transport = struct {
             @panic("must set file for test transport!");
         }
 
-        self.reader = try file.readerFromPath(
+        const f = try std.Io.Dir.cwd().openFile(
             self.io,
-            &self.r_buffer,
             self.options.f.?,
+            .{ .mode = .read_only },
         );
+        self.fd = f.handle;
 
-        file.setNonBlocking(self.reader.?.file.handle) catch {
+        file.setNonBlocking(self.fd.?) catch {
             return errors.wrapCriticalError(
                 errors.ScrapliError.Transport,
                 @src(),
@@ -104,7 +102,11 @@ pub const Transport = struct {
 
     /// Close the transport object.
     pub fn close(self: *Transport) void {
-        self.reader.?.file.close(self.io);
+        if (self.fd) |fd| {
+            _ = std.c.close(fd);
+
+            self.fd = null;
+        }
     }
 
     /// Write to the transport object. A noop for the test transport.
@@ -115,9 +117,12 @@ pub const Transport = struct {
 
     /// Read from the transport object.
     pub fn read(self: *Transport, buf: []u8) !usize {
-        const ri = &self.reader.?.interface;
-
-        const n = try ri.readSliceShort(buf);
+        const n = std.posix.read(self.fd.?, buf) catch |err| {
+            switch (err) {
+                error.WouldBlock => return 0,
+                else => return err,
+            }
+        };
 
         return n;
     }

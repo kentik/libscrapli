@@ -1,7 +1,13 @@
 const std = @import("std");
 
-const bytes = @import("bytes.zig");
 const operation = @import("cli-operation.zig");
+
+/// Holds options related to how a result should look.
+pub const GetResultOptions = struct {
+    delimiter: []const u8 = "\n",
+    normalize_line_feeds: bool = true,
+    normalize_trailing_whitespace: bool = true,
+};
 
 /// Holds result information for Cli opereations.
 pub const Result = struct {
@@ -86,23 +92,13 @@ pub const Result = struct {
         data: struct {
             input: []const u8 = "",
             rets: [2][]const u8,
-            trim_processed: bool = true,
         },
     ) !void {
         try self.splits_ns.append(self.allocator, std.Io.Timestamp.now(self.io, .real).nanoseconds);
         try self.inputs.append(self.allocator, data.input);
         try self.results_raw.append(self.allocator, data.rets[0]);
 
-        if (data.trim_processed) {
-            // trimWhitespace allocates new memory properly sized, so we can then free
-            // up the original "processed" buf (it is "processed" becuase ansi/ascii stuff is
-            // removed, but we still trim whitespace to get rid of leading/trailing junk)
-            const trimmed = try bytes.trimNewlineWhitespace(self.allocator, data.rets[1]);
-            self.allocator.free(data.rets[1]);
-            try self.results.append(self.allocator, trimmed);
-        } else {
-            try self.results.append(self.allocator, data.rets[1]);
-        }
+        try self.results.append(self.allocator, data.rets[1]);
 
         if (self.failed_indicators == null) {
             return;
@@ -119,7 +115,7 @@ pub const Result = struct {
 
                 // this can be slow if rets[1] is v large, and theres no reason continuing if we
                 // failed, so we are done here.
-                break;
+                return;
             }
         }
     }
@@ -194,9 +190,7 @@ pub const Result = struct {
     /// result out of zig into the ffi layer.
     pub fn getInputLen(
         self: *Result,
-        options: struct {
-            delimiter: []const u8 = "\n",
-        },
+        options: GetResultOptions,
     ) usize {
         var out_size: usize = 0;
 
@@ -216,9 +210,7 @@ pub const Result = struct {
     /// result out of zig into the ffi layer.
     pub fn getResultRawLen(
         self: *Result,
-        options: struct {
-            delimiter: []const u8 = "\n",
-        },
+        options: GetResultOptions,
     ) usize {
         var out_size: usize = 0;
 
@@ -238,9 +230,7 @@ pub const Result = struct {
     pub fn getResultRaw(
         self: *Result,
         allocator: std.mem.Allocator,
-        options: struct {
-            delimiter: []const u8 = "\n",
-        },
+        options: GetResultOptions,
     ) ![]const u8 {
         const out = try allocator.alloc(
             u8,
@@ -271,54 +261,205 @@ pub const Result = struct {
     /// result out of zig into the ffi layer.
     pub fn getResultLen(
         self: *Result,
-        options: struct {
-            delimiter: []const u8 = "\n",
-        },
+        options: GetResultOptions,
     ) usize {
-        var out_size: usize = 0;
-
-        for (0.., self.results.items) |idx, result| {
-            out_size += result.len;
-
-            if (idx != self.results.items.len - 1) {
-                // not last result, add spacing for the delimiter
-                out_size += options.delimiter.len;
-            }
-        }
-
-        return out_size;
+        return getJoinedLen(self.results.items, options);
     }
 
     /// Returns all results joined on options.delim string, caller owns joined string.
     pub fn getResult(
         self: *Result,
         allocator: std.mem.Allocator,
-        options: struct {
-            delimiter: []const u8 = "\n",
-        },
+        options: GetResultOptions,
     ) ![]const u8 {
         const out = try allocator.alloc(
             u8,
             self.getResultLen(
-                .{
-                    .delimiter = options.delimiter,
-                },
+                options,
             ),
         );
 
+        try self.getResultPreAllocated(
+            out,
+            options,
+        );
+
+        return out;
+    }
+
+    /// Returns all results joined on options.delim string, but expects user to have already
+    /// allocated buf to the appropriate size (hint: use getResultLen w/ the same options).
+    pub fn getResultPreAllocated(
+        self: *Result,
+        out: []u8,
+        options: GetResultOptions,
+    ) !void {
+        if (out.len == 0) return;
+
         var cur: usize = 0;
+        var pending_ws: usize = 0;
+
         for (0.., self.results.items) |idx, result| {
-            @memcpy(out[cur .. cur + result.len], result);
-            cur += result.len;
+            const render_result = if (options.normalize_trailing_whitespace)
+                std.mem.trim(u8, result, "\t\n\r")
+            else
+                result;
+
+            for (render_result) |ch| {
+                if (options.normalize_line_feeds and ch == '\r') continue;
+
+                if (options.normalize_trailing_whitespace) {
+                    if (ch == '\n') {
+                        pending_ws = 0;
+
+                        out[cur] = ch;
+                        cur += 1;
+                    } else if (ch == ' ' or ch == '\t') {
+                        pending_ws += 1;
+                    } else {
+                        var i: usize = 0;
+                        while (i < pending_ws) : (i += 1) {
+                            out[cur] = ' ';
+                            cur += 1;
+                        }
+                        pending_ws = 0;
+
+                        out[cur] = ch;
+                        cur += 1;
+                    }
+                } else {
+                    out[cur] = ch;
+                    cur += 1;
+                }
+            }
 
             if (idx != self.results.items.len - 1) {
+                if (options.normalize_trailing_whitespace) {
+                    pending_ws = 0;
+                }
+
                 for (options.delimiter) |delimiter_char| {
                     out[cur] = delimiter_char;
                     cur += 1;
                 }
             }
         }
+    }
 
-        return out;
+    /// Returns all raw results joined on options.delim string, but expects user to have already
+    /// allocated buf to the appropriate size (hint: use getResultRawLen w/ the same options).
+    pub fn getResultRawPreAllocated(
+        self: *Result,
+        out: []u8,
+        options: GetResultOptions,
+    ) !void {
+        var cur: usize = 0;
+
+        for (0.., self.results_raw.items) |idx, result_raw| {
+            @memcpy(out[cur .. cur + result_raw.len], result_raw);
+            cur += result_raw.len;
+
+            if (idx != self.results_raw.items.len - 1) {
+                for (options.delimiter) |delimiter_char| {
+                    out[cur] = delimiter_char;
+                    cur += 1;
+                }
+            }
+        }
     }
 };
+
+fn getJoinedLen(
+    items: []const []const u8,
+    options: GetResultOptions,
+) usize {
+    var len: usize = 0;
+
+    var line_start: usize = 0;
+    var pending_ws: usize = 0;
+
+    for (0.., items) |idx, result| {
+        const render_result = if (options.normalize_trailing_whitespace)
+            std.mem.trim(u8, result, "\t\n\r")
+        else
+            result;
+
+        for (render_result) |ch| {
+            if (options.normalize_line_feeds and ch == '\r') continue;
+
+            if (options.normalize_trailing_whitespace) {
+                if (ch == '\n') {
+                    pending_ws = 0;
+                    len += 1;
+                    line_start = len;
+                } else if (ch == ' ' or ch == '\t') {
+                    pending_ws += 1;
+                } else {
+                    len += pending_ws;
+                    pending_ws = 0;
+                    len += 1;
+                }
+            } else {
+                len += 1;
+            }
+        }
+
+        if (idx != items.len - 1) {
+            if (options.normalize_trailing_whitespace) {
+                pending_ws = 0;
+            }
+
+            len += options.delimiter.len;
+
+            line_start = len;
+            pending_ws = 0;
+        }
+    }
+
+    return len;
+}
+
+test "getJoinedLen" {
+    const cases = [_]struct {
+        items: []const []const u8,
+        options: GetResultOptions,
+        expected: usize,
+    }{
+        .{
+            // nothing to change
+            .items = &.{ "foo", "bar" },
+            .options = .{},
+            .expected = 7,
+        },
+        .{
+            // trailing whitespace
+            .items = &.{ "foo ", "bar" },
+            .options = .{},
+            .expected = 7,
+        },
+        .{
+            // crlf
+            .items = &.{ "foo\x0D\x0A", "bar" },
+            .options = .{},
+            .expected = 7,
+        },
+        .{
+            // crlf
+            .items = &.{"\x0D\x0Afoo"},
+            .options = .{},
+            .expected = 3,
+        },
+        .{
+            // trailing space
+            .items = &.{"foo "},
+            .options = .{},
+            .expected = 3,
+        },
+    };
+
+    for (cases) |case| {
+        const actual = getJoinedLen(case.items, case.options);
+
+        try std.testing.expectEqual(case.expected, actual);
+    }
+}

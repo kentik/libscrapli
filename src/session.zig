@@ -68,6 +68,8 @@ const Recorder = struct {
 
     fn close(self: *Recorder, io: std.Io) !void {
         if (self.rd) |rd| {
+            defer self.rd = null;
+
             switch (rd) {
                 .f => {
                     // when just given a file path we'll "own" that lifecycle and close/cleanup
@@ -75,6 +77,7 @@ const Recorder = struct {
                     // and especially for tests!); otherwise we'll leave it to the user
                     try self.recorder.?.interface.flush();
                     self.recorder.?.file.close(io);
+                    self.recorder = null;
 
                     try ascii.stripAsciiAndAnsiControlCharsInFile(io, rd.f);
                 },
@@ -196,7 +199,10 @@ pub const Session = struct {
         u8,
         .dynamic,
     ),
-    read_thread_errored: bool = false,
+    read_thread_errored: std.atomic.Value(bool),
+    read_thread_error: ?anyerror = null,
+    read_into_buf: ?[]u8 = null,
+    read_loop_buf: ?[]u8 = null,
 
     recorder_buf: [1024]u8 = [_]u8{0} ** 1024,
     recorder: Recorder,
@@ -220,7 +226,7 @@ pub const Session = struct {
         auth_options: *auth.Options,
         transport_options: *transport.Options,
     ) !*Session {
-        logging.traceWithSrc(log, @src(), "session.Session initializing", .{});
+        logging.traceWithSrc(log, @src(), "session.Session init requested", .{});
 
         const t = try transport.Transport.init(
             allocator,
@@ -246,6 +252,9 @@ pub const Session = struct {
                 u8,
                 .dynamic,
             ).init(allocator),
+            .read_thread_errored = std.atomic.Value(bool).init(false),
+            .read_into_buf = try allocator.alloc(u8, options.read_size),
+            .read_loop_buf = try allocator.alloc(u8, options.read_size),
             .recorder = try Recorder.init(io, options.record_destination, &s.recorder_buf),
             .prompt_pattern = prompt_pattern,
             .last_consumed_prompt = .empty,
@@ -303,30 +312,28 @@ pub const Session = struct {
 
     /// Deinitializes the session object.
     pub fn deinit(self: *Session) void {
-        logging.traceWithSrc(self.log, @src(), "session.Session deinitializing", .{});
+        logging.traceWithSrc(self.log, @src(), "session.Session deinit requested", .{});
 
-        if (self.read_stop.load(std.builtin.AtomicOrder.acquire) == ReadThreadState.run) {
-            // if for whatever reason (likely because a call to driver.open failed causing a defer
-            // close to *not* trigger) the session didnt get "closed", ensure we do that...
-            // but... we ignore errors here since we want deinit to return void and it really
-            // shouldn't matter if something errors during close
-            // zlint-disable-next-line suppressed-errors
-            self.close() catch |err| {
-                self.log.warn(
-                    "session.Session, deinit: close returned an error '{}', ignoring",
-                    .{err},
-                );
-            };
-        }
-
-        // if close didnt happen and the read thread state was already set to stop, we may have not
-        // shut down the read thread completely, so make sure we do that too
-        if (self.read_thread) |t| {
-            t.join();
-            self.read_thread = null;
-        }
+        // ensure we always call close to tidy up the recorder and transport, even if the session
+        // never reached the "run" state, close is idempotent so its worst case an extra function
+        // call but who cares
+        // zlint-disable-next-line suppressed-errors
+        self.close() catch |err| {
+            self.log.warn(
+                "session.Session deinit: close returned an error '{}', ignoring",
+                .{err},
+            );
+        };
 
         self.last_consumed_prompt.deinit(self.allocator);
+
+        if (self.read_into_buf) |b| {
+            self.allocator.free(b);
+        }
+
+        if (self.read_loop_buf) |b| {
+            self.allocator.free(b);
+        }
 
         if (self.compiled_username_pattern != null) {
             re.pcre2Free(self.compiled_username_pattern.?);
@@ -408,30 +415,19 @@ pub const Session = struct {
     }
 
     /// Closes the session, stopping the read thread, unblocking any in flight reads of the
-    /// transport, flushing the recordre, and finally closing the transport object itself.
+    /// transport, flushing the recorder, and finally closing the transport object itself.
     pub fn close(self: *Session) !void {
         self.log.info("session.Session close requested", .{});
 
-        self.read_stop.store(ReadThreadState.stop, std.builtin.AtomicOrder.unordered);
-
-        while (self.read_stop.load(std.builtin.AtomicOrder.acquire) != ReadThreadState.stop) {
-            std.Io.Clock.Duration.sleep(
-                .{
-                    .clock = .awake,
-                    .raw = .fromNanoseconds(self.options.read_min_delay_ns),
-                },
-                self.io,
-            ) catch |err| {
-                self.log.warn(
-                    "session.Session open: sleep error '{}', ignoring",
-                    .{err},
-                );
-            };
+        if (self.read_stop.load(std.builtin.AtomicOrder.acquire) != ReadThreadState.run) {
+            return;
         }
+
+        self.read_stop.store(ReadThreadState.stop, std.builtin.AtomicOrder.unordered);
 
         // need to unblock the transport waiter after signaling the read thread to stop, this will
         // stop the waiter (which happens in transport.read), then the readloop can nicely exit
-        try self.transport.unblock();
+        try self.transport.prepareClose();
 
         if (self.read_thread) |t| {
             t.join();
@@ -446,14 +442,12 @@ pub const Session = struct {
     fn readLoop(self: *Session) !void {
         self.log.info("session.Session read thread started", .{});
 
-        errdefer self.read_thread_errored = true;
-
-        var buf = try self.allocator.alloc(u8, self.options.read_size);
-        defer self.allocator.free(buf);
+        const buf = self.read_loop_buf.?;
 
         while (self.read_stop.load(std.builtin.AtomicOrder.acquire) != ReadThreadState.stop) {
-            const n = self.transport.read(buf) catch {
-                self.read_thread_errored = true;
+            const n = self.transport.read(buf) catch |err| {
+                self.read_thread_error = err;
+                self.read_thread_errored.store(true, std.builtin.AtomicOrder.release);
 
                 return;
             };
@@ -462,9 +456,12 @@ pub const Session = struct {
                 continue;
             }
 
-            try self.read_lock.lock(self.io);
-            try self.read_queue.write(buf[0..n]);
-            self.read_lock.unlock(self.io);
+            {
+                try self.read_lock.lock(self.io);
+                defer self.read_lock.unlock(self.io);
+
+                try self.read_queue.write(buf[0..n]);
+            }
 
             // log all the reads w/ ascii unprintables shown
             logging.traceWithSrc(
@@ -485,9 +482,15 @@ pub const Session = struct {
         try self.read_lock.lock(self.io);
         defer self.read_lock.unlock(self.io);
 
-        if (self.read_thread_errored and self.read_queue.readableLength() == 0) {
+        if (self.read_thread_errored.load(std.builtin.AtomicOrder.acquire) and
+            self.read_queue.readableLength() == 0)
+        {
             // once the read thread is errored out and there is nothing else to
             // read
+            if (self.read_thread_error) |err| {
+                return err;
+            }
+
             return errors.ScrapliError.EOF;
         }
 
@@ -497,12 +500,13 @@ pub const Session = struct {
     /// Writes the given buffer to the transport -- redacted ensures we do not show the input in
     /// the logging output.
     pub fn write(self: *Session, buf: []const u8, redacted: bool) !void {
-        self.log.info("session.Session write requested", .{});
-
         if (!redacted) {
-            self.log.debug("session.Session write: '{f}'", .{std.ascii.hexEscape(buf, .lower)});
+            self.log.debug(
+                "session.Session write requested, buf: '{f}'",
+                .{std.ascii.hexEscape(buf, .lower)},
+            );
         } else {
-            self.log.debug("session.Session write: <redacted>", .{});
+            self.log.debug("session.Session write: buf: <redacted>", .{});
         }
 
         try self.transport.write(buf);
@@ -510,7 +514,7 @@ pub const Session = struct {
 
     /// Writes the configured return character to the transport.
     pub fn writeReturn(self: *Session) !void {
-        self.log.info("session.Session writeReturn requested", .{});
+        self.log.debug("session.Session writeReturn requested", .{});
 
         try self.write(self.options.return_char, false);
     }
@@ -533,6 +537,8 @@ pub const Session = struct {
     ) ![2][]const u8 {
         self.log.info("session.Session authenticate requested", .{});
 
+        var cur_read_delay_ns: u64 = self.options.read_min_delay_ns;
+
         var bufs = bytes.ProcessedBuf.init(allocator);
         defer bufs.deinit();
 
@@ -542,14 +548,13 @@ pub const Session = struct {
         var auth_password_prompt_seen_count: u8 = 0;
         var auth_passphrase_prompt_seen_count: u8 = 0;
 
-        var buf = try allocator.alloc(u8, self.options.read_size);
-        defer allocator.free(buf);
+        const buf = self.read_into_buf orelse return errors.ScrapliError.Session;
 
         // need to unblock the transport waiter after signaling the read thread to stop, this will
         // stop the waiter (which happens in transport.read), then the readloop can nicely exit;
         // we only need to do this here in addition to close because we
         // zlinter-disable-next-line no_swallow_error - best effort
-        errdefer self.transport.unblock() catch {};
+        errdefer self.transport.prepareClose() catch {};
 
         // in the case of auth, if we error out, we almost certainly need to stop the read loop
         // as the transport is probably gone from under our feet anyway.
@@ -620,7 +625,27 @@ pub const Session = struct {
             };
 
             if (n == 0) {
+                std.Io.Clock.Duration.sleep(
+                    .{
+                        .clock = .awake,
+                        .raw = .fromNanoseconds(cur_read_delay_ns),
+                    },
+                    self.io,
+                ) catch |err| {
+                    self.log.warn(
+                        "session.Session authenticate: sleep error '{}', ignoring",
+                        .{err},
+                    );
+                };
+
+                cur_read_delay_ns = Session.getReadBackoff(
+                    cur_read_delay_ns,
+                    self.options.read_max_delay_ns,
+                );
+
                 continue;
+            } else {
+                cur_read_delay_ns = self.options.read_min_delay_ns;
             }
 
             try bufs.appendSlice(buf[0..n]);
@@ -806,7 +831,10 @@ pub const Session = struct {
         bufs: *bytes.ProcessedBuf,
         search_depth: u64,
     ) !bytes_check.MatchPositions {
-        self.log.info("session.Session readTimeout requested", .{});
+        self.log.debug(
+            "session.Session readTimeout requested. start timestamp ms: {d}, search depth: {d}",
+            .{ start_timestamp.toNanoseconds(), search_depth },
+        );
 
         var cur_read_delay_ns: u64 = self.options.read_min_delay_ns;
 
@@ -816,8 +844,7 @@ pub const Session = struct {
         // increase the found start/end positions by this value too!
         const op_processed_buf_starting_len = bufs.processed.items.len;
 
-        var buf = try self.allocator.alloc(u8, self.options.read_size);
-        defer self.allocator.free(buf);
+        const buf = self.read_into_buf orelse return errors.ScrapliError.Session;
 
         while (true) {
             if (cancel != null and cancel.?.*) {
@@ -848,7 +875,9 @@ pub const Session = struct {
                 }
             }
 
-            defer {
+            const n = try self.read(buf);
+
+            if (n == 0) {
                 std.Io.Clock.Duration.sleep(
                     .{
                         .clock = .awake,
@@ -861,11 +890,7 @@ pub const Session = struct {
                         .{err},
                     );
                 };
-            }
 
-            const n = try self.read(buf);
-
-            if (n == 0) {
                 cur_read_delay_ns = Session.getReadBackoff(
                     cur_read_delay_ns,
                     self.options.read_max_delay_ns,
@@ -894,9 +919,24 @@ pub const Session = struct {
 
             var match_indexes = try checkF(check_args, searchable_buf);
 
+            logging.traceWithSrc(
+                self.log,
+                @src(),
+                "session.Session readTimeout: processed_len {d}, searchable_len {d}, " ++
+                    "match start/end in searchable buf {d}/{d}, " ++
+                    "searchable_buf '{s}'",
+                .{
+                    bufs.processed.items.len,
+                    searchable_buf.len,
+                    match_indexes.start,
+                    match_indexes.end,
+                    searchable_buf,
+                },
+            );
+
             if (!(match_indexes.start == 0 and match_indexes.end == 0)) {
                 match_indexes.start += (bufs.processed.items.len - searchable_buf.len);
-                match_indexes.end += (bufs.processed.items.len - searchable_buf.len) + 1;
+                match_indexes.end += (bufs.processed.items.len - searchable_buf.len);
 
                 self.log.debug(
                     "session.Session readTimeout: found check match in " ++
@@ -998,7 +1038,7 @@ pub const Session = struct {
             owned_found_prompt,
         );
 
-        return [2][]const u8{ try bufs.raw.toOwnedSlice(self.allocator), owned_found_prompt };
+        return [2][]const u8{ try bufs.raw.toOwnedSlice(allocator), owned_found_prompt };
     }
 
     fn innerSendInput(
@@ -1009,6 +1049,17 @@ pub const Session = struct {
         input_handling: operation.InputHandling,
         bufs: *bytes.ProcessedBuf,
     ) !bytes_check.MatchPositions {
+        logging.traceWithSrc(
+            self.log,
+            @src(),
+            "session.Session innerSendInput: input_handling '{s}', input_len {d}, input '{s}'",
+            .{
+                @tagName(input_handling),
+                input.len,
+                input,
+            },
+        );
+
         const check_args = bytes_check.CheckArgs{
             .pattern = self.compiled_prompt_pattern,
             .actual = input,
@@ -1063,6 +1114,22 @@ pub const Session = struct {
         return match_indexes;
     }
 
+    fn prependLastConsumedPrompt(self: *Session, bufs: *bytes.ProcessedBuf) !void {
+        if (self.last_consumed_prompt.items.len == 0) {
+            return;
+        }
+
+        try bufs.appendSlice(self.last_consumed_prompt.items);
+        try self.last_consumed_prompt.resize(self.allocator, 0);
+    }
+
+    fn storeLastConsumedPrompt(
+        self: *Session,
+        buf: []const u8,
+    ) !void {
+        try self.last_consumed_prompt.appendSlice(self.allocator, buf);
+    }
+
     /// Sends the given input to the transport, reading until the input is written, then sending
     /// return, then reading until the next prompt is read. It returns two buffers -- the "raw"
     /// buffer, that is the unprocessed content that we read from the device, and the "processed"
@@ -1081,12 +1148,7 @@ pub const Session = struct {
         var bufs = bytes.ProcessedBuf.init(allocator);
         defer bufs.deinit();
 
-        if (self.last_consumed_prompt.items.len != 0) {
-            // if we had some prompt consumed, stuff it on the raw and processed buffers and then
-            // re-zeroize
-            try bufs.appendSlice(self.last_consumed_prompt.items);
-            try self.last_consumed_prompt.resize(self.allocator, 0);
-        }
+        try self.prependLastConsumedPrompt(&bufs);
 
         _ = try self.innerSendInput(
             start_time,
@@ -1115,8 +1177,7 @@ pub const Session = struct {
             self.options.operation_max_search_depth,
         );
 
-        try self.last_consumed_prompt.appendSlice(
-            self.allocator,
+        try self.storeLastConsumedPrompt(
             bufs.processed.items[prompt_indexes.start..prompt_indexes.end],
         );
 
@@ -1190,12 +1251,7 @@ pub const Session = struct {
         var bufs = bytes.ProcessedBuf.init(allocator);
         defer bufs.deinit();
 
-        if (self.last_consumed_prompt.items.len != 0) {
-            // if we had some prompt consumed, stuff it on the raw and processed buffers and then
-            // re-zeroize
-            try bufs.appendSlice(self.last_consumed_prompt.items);
-            try self.last_consumed_prompt.resize(self.allocator, 0);
-        }
+        try self.prependLastConsumedPrompt(&bufs);
 
         _ = try self.innerSendInput(
             start_time,
@@ -1204,6 +1260,9 @@ pub const Session = struct {
             options.input_handling,
             &bufs,
         );
+
+        const responseCheckF: bytes_check.CheckF =
+            if (compiled_pattern) |_| &bytes_check.anyPatternInBuf else &bytes_check.exactInBuf;
 
         var check_args = bytes_check.CheckArgs{
             .actual = options.prompt_exact,
@@ -1221,7 +1280,7 @@ pub const Session = struct {
         _ = try self.readTimeout(
             start_time,
             options.cancel,
-            bytes_check.exactInBuf,
+            responseCheckF,
             check_args,
             &bufs,
             self.options.operation_max_search_depth,
@@ -1233,7 +1292,7 @@ pub const Session = struct {
             _ = try self.innerSendInput(
                 start_time,
                 options.cancel,
-                options.input,
+                options.response,
                 options.input_handling,
                 &bufs,
             );
@@ -1248,8 +1307,7 @@ pub const Session = struct {
             self.options.operation_max_search_depth,
         );
 
-        try self.last_consumed_prompt.appendSlice(
-            self.allocator,
+        try self.storeLastConsumedPrompt(
             bufs.processed.items[prompt_indexes.start..prompt_indexes.end],
         );
 

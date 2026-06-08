@@ -1,8 +1,32 @@
 .DEFAULT_GOAL := help
 
-## Show this help
+BLUE   := $(shell tput -Txterm setaf 4)
+YELLOW := $(shell tput -Txterm setaf 3)
+GREEN  := $(shell tput -Txterm setaf 2)
+RESET  := $(shell tput -Txterm sgr0)
+
+.PHONY: help
+
 help:
-	@awk -f build/makefile-doc.awk $(MAKEFILE_LIST)
+	@echo ""
+	@echo "${YELLOW}Usage:${RESET} make ${GREEN}<target>${RESET}"
+	@echo ""
+	@awk ' \
+    	/^##@@/ { gsub(/^##@@ */, ""); printf "\n${BLUE}%s${RESET}\n", toupper($$0); next } \
+    	/^##@/  { gsub(/^##@ */, ""); printf "  ${YELLOW}%s:${RESET}\n", $$0; next } \
+    	/^## /   { gsub(/^## */, ""); msg = $$0; next } \
+    	/^[a-zA-Z0-9_-]+:/ { \
+    	    target = $$1; gsub(/:.*/, "", target); \
+        	if (match($$0, /## */)) { \
+        	    msg = substr($$0, RSTART + RLENGTH); \
+            } \
+           	if (msg != "") { \
+           	    printf "    ${GREEN}%-18s${RESET} %s\n", target, msg; \
+               	msg = ""; \
+            } \
+    	} \
+	' $(MAKEFILE_LIST)
+	@echo ""
 
 ##@ Housekeeping
 ## Nukes the zig-out dir
@@ -141,7 +165,7 @@ build: fmt clean-zig-cache
 		-Ddependency-linkage=static \
 		--summary all
 
-## Build all the shared objects w/ release optimization
+## Build all the shared objects w/ release optimization and static deps
 build-release: fmt clean-zig-out clean-zig-cache
 	zig build ffi \
 	    -Doptimize=ReleaseSafe \
@@ -153,6 +177,54 @@ build-release: fmt clean-zig-out clean-zig-cache
 	    \( -name 'libscrapli.*.dylib' -o -name 'libscrapli.so.*' \) \
 	    -exec sha256sum {} + \
 	    > zig-out/checksums.txt
+
+## Build the shared object for the local system w/ release optimization and dynamic deps
+build-release-dynamic: fmt clean-zig-cache
+	zig build ffi \
+	    -Doptimize=ReleaseSafe \
+		-freference-trace=4 \
+		-Ddependency-linkage=dynamic \
+		--summary all
+	find zig-out -type f \
+	    \( -name 'libscrapli.*.dylib' -o -name 'libscrapli.so.*' \) \
+	    -exec sha256sum {} + \
+	    > zig-out/checksums.txt
+
+## Build the macOS release artifact with static deps
+release-macos-static: clean-zig-cache
+	zig build ffi \
+	    -Doptimize=ReleaseSafe \
+		-freference-trace=4 \
+		-Ddependency-linkage=static \
+		-Dtarget=aarch64-macos \
+		--summary all
+
+## Build the macOS release artifact with dynamic deps
+release-macos-dynamic: clean-zig-cache
+	zig build ffi \
+	    -Doptimize=ReleaseSafe \
+		-freference-trace=4 \
+		-Ddependency-linkage=dynamic \
+		-Dtarget=aarch64-macos \
+		--summary all
+
+## Build a linux release artifact with static deps
+release-linux-static: clean-zig-cache
+	zig build ffi \
+	    -Doptimize=ReleaseSafe \
+		-freference-trace=4 \
+		-Ddependency-linkage=static \
+		-Dtarget=$(TARGET) \
+		--summary all
+
+## Build a linux release artifact with dynamic deps
+release-linux-dynamic: clean-zig-cache
+	zig build ffi \
+	    -Doptimize=ReleaseSafe \
+		-freference-trace=4 \
+		-Ddependency-linkage=dynamic \
+		-Dtarget=$(TARGET) \
+		--summary all
 
 ## Build the example binaries, uses Debug build so you get leak checking
 build-examples: fmt clean-zig-cache

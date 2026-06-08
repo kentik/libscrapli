@@ -22,7 +22,7 @@ const default_telnet_port: u16 = 23;
 pub const DefinitionSource = union(enum) {
     string: []const u8,
     file: []const u8,
-    definition: *platform.Definition,
+    definition: *platform.Options,
 };
 
 /// A config object holding info for a cli driver.
@@ -73,6 +73,19 @@ pub const Options = struct {
         self.transport.deinit();
         self.allocator.destroy(self);
     }
+
+    fn validate(self: *Options, log: logging.Logger) !void {
+        switch (self.transport.*) {
+            .bin => {
+                if (self.auth.private_key_content != null) {
+                    // its only a warning, for future things we may want to actually return errors
+                    // here but in this particular case we'll just warn
+                    log.warn("auth private_key_content set, but is ignored for bin transport", .{});
+                }
+            },
+            else => {},
+        }
+    }
 };
 
 /// The cli "driver" -- the thing that drives a cli (telnet/ssh/etc.) connection.
@@ -103,23 +116,9 @@ pub const Driver = struct {
 
         logging.traceWithSrc(log, @src(), "cli.Driver initializing", .{});
 
-        const definition = switch (config.definition) {
-            .string => |d| try platform.YamlDefinition.toDefinition(
-                allocator,
-                io,
-                .{
-                    .string = d,
-                },
-            ),
-            .file => |d| try platform.YamlDefinition.toDefinition(
-                allocator,
-                io,
-                .{
-                    .file = d,
-                },
-            ),
-            .definition => |d| d,
-        };
+        try opts.validate(log);
+
+        const definition = try Driver.loadDefinition(allocator, io, config.definition);
 
         const d = try allocator.create(Driver);
 
@@ -166,6 +165,33 @@ pub const Driver = struct {
         self.definition.deinit();
         self.options.deinit();
         self.allocator.destroy(self);
+    }
+
+    fn loadDefinition(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        definition_source: DefinitionSource,
+    ) !*platform.Definition {
+        return switch (definition_source) {
+            .string => |d| try platform.YamlDefinition.toDefinition(
+                allocator,
+                io,
+                .{
+                    .string = d,
+                },
+            ),
+            .file => |d| try platform.YamlDefinition.toDefinition(
+                allocator,
+                io,
+                .{
+                    .file = d,
+                },
+            ),
+            .definition => |d| try platform.Definition.init(
+                allocator,
+                d.*,
+            ),
+        };
     }
 
     /// Create a new result object for the given operation.
@@ -263,12 +289,9 @@ pub const Driver = struct {
 
         var res = try self.newResult(
             allocator,
-            operation.Kind.open,
+            operation.Kind.close,
         );
         errdefer res.deinit();
-
-        var op_buf: std.ArrayList(u8) = .empty;
-        defer op_buf.deinit(allocator);
 
         if (self.definition.onCloseCallback != null or
             self.definition.bound_on_close_callback != null)
@@ -341,7 +364,7 @@ pub const Driver = struct {
                 @src(),
                 self.log,
                 "cli.Driver no mode '{s}' in definition",
-                .{self.current_mode},
+                .{options.requested_mode},
             );
         }
 
@@ -364,9 +387,15 @@ pub const Driver = struct {
             ),
         );
 
+        const current_prompt = std.mem.trim(
+            u8,
+            res.results.items[0],
+            "\t\n\r",
+        );
+
         self.current_mode = mode.determineMode(
             self.definition.modes,
-            res.results.items[0],
+            current_prompt,
         ) catch |err| {
             return errors.wrapCriticalError(
                 err,
@@ -374,8 +403,8 @@ pub const Driver = struct {
                 self.log,
                 "cli.Driver enterMode: failed determining prompt from '{s}' | {X}",
                 .{
-                    res.results.items[0],
-                    res.results.items[0],
+                    current_prompt,
+                    current_prompt,
                 },
             );
         };
@@ -589,26 +618,60 @@ pub const Driver = struct {
         );
         errdefer res.deinit();
 
-        for (options.inputs) |input| {
-            try res.record(
-                .{
-                    .input = input,
-                    .rets = try self.session.sendInput(
-                        allocator,
-                        .{
-                            .cancel = options.cancel,
-                            .input = input,
-                            .requested_mode = options.requested_mode,
-                            .input_handling = options.input_handling,
-                            .retain_input = options.retain_input,
-                            .retain_trailing_prompt = options.retain_trailing_prompt,
-                        },
-                    ),
-                },
+        if (options._ffi_inputs != null and options.inputs.len == 0) {
+            // annoying to have to do this for the ffi bits but this keeps the ffi able to very
+            // easily call this (rather than ranging over inputs and calling sendInput from the
+            // calling program) so we have consistent behavior
+            var ffi_inputs_iterator = std.mem.splitSequence(
+                u8,
+                options._ffi_inputs.?,
+                bytes.libscrapli_delimiter,
             );
 
-            if (options.stop_on_indicated_failure and res.result_failure_indicated) {
-                return res;
+            while (ffi_inputs_iterator.next()) |input| {
+                try res.record(
+                    .{
+                        .input = input,
+                        .rets = try self.session.sendInput(
+                            allocator,
+                            .{
+                                .cancel = options.cancel,
+                                .input = input,
+                                .requested_mode = options.requested_mode,
+                                .input_handling = options.input_handling,
+                                .retain_input = options.retain_input,
+                                .retain_trailing_prompt = options.retain_trailing_prompt,
+                            },
+                        ),
+                    },
+                );
+
+                if (options.stop_on_indicated_failure and res.result_failure_indicated) {
+                    return res;
+                }
+            }
+        } else {
+            for (options.inputs) |input| {
+                try res.record(
+                    .{
+                        .input = input,
+                        .rets = try self.session.sendInput(
+                            allocator,
+                            .{
+                                .cancel = options.cancel,
+                                .input = input,
+                                .requested_mode = options.requested_mode,
+                                .input_handling = options.input_handling,
+                                .retain_input = options.retain_input,
+                                .retain_trailing_prompt = options.retain_trailing_prompt,
+                            },
+                        ),
+                    },
+                );
+
+                if (options.stop_on_indicated_failure and res.result_failure_indicated) {
+                    return res;
+                }
             }
         }
 
@@ -685,7 +748,6 @@ pub const Driver = struct {
         try res.record(
             .{
                 .rets = try self.session.readAny(allocator, options),
-                .trim_processed = false,
             },
         );
 
@@ -838,6 +900,60 @@ pub const Driver = struct {
 
         return res;
     }
+
+    //// Replaces the configured definition. This frees the existing definition and compiled prompt
+    /// pattern, replacing them both with the given definition source. You may want to use this in
+    /// situations like connecting to a device via a console server (starting with a definition that
+    /// has no concept of modes and an ultra grabby prompt pattern (maybe even `.*`)) - then once
+    /// attached to a network device you want to replace the definition to be "cisco_iosxe" or
+    /// similar. Basically the same as the historical scrapli `commandeer` functionality.
+    pub fn replaceDefinition(
+        self: *Driver,
+        definition_source: DefinitionSource,
+    ) !void {
+        self.log.info("cli.Driver replaceDefinition requested", .{});
+
+        const new_definition = try Driver.loadDefinition(
+            self.allocator,
+            self.io,
+            definition_source,
+        );
+        errdefer new_definition.deinit();
+
+        const pattern_changed = !std.mem.eql(
+            u8,
+            new_definition.prompt_pattern,
+            self.definition.prompt_pattern,
+        );
+
+        var new_compiled_pattern = self.session.compiled_prompt_pattern;
+
+        if (pattern_changed) {
+            new_compiled_pattern = re.pcre2Compile(new_definition.prompt_pattern);
+
+            if (new_compiled_pattern == null) {
+                return errors.wrapCriticalError(
+                    errors.ScrapliError.Driver,
+                    @src(),
+                    self.log,
+                    "cli.replaceDefinition: failed compiling prompt pattern {s}",
+                    .{new_definition.prompt_pattern},
+                );
+            }
+        }
+
+        self.definition.deinit();
+        self.definition = new_definition;
+
+        if (pattern_changed) {
+            if (self.session.compiled_prompt_pattern) |p| {
+                re.pcre2Free(p);
+            }
+
+            self.session.prompt_pattern = new_definition.prompt_pattern;
+            self.session.compiled_prompt_pattern = new_compiled_pattern;
+        }
+    }
 };
 
 /// Check if a "read callback" should execute based on the given buffer.
@@ -875,6 +991,8 @@ pub fn readCallbackShouldExecute(
         if (compiled_cp == null) {
             return errors.ScrapliError.Operation;
         }
+
+        defer re.pcre2Free(compiled_cp.?);
 
         const match = try re.pcre2Find(
             compiled_cp.?,

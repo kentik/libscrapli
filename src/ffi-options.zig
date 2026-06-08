@@ -62,6 +62,8 @@ pub const FFIOptions = extern struct {
     cli: extern struct {
         definition_str: [*c]const u8 = undefined,
         definition_str_len: usize = 0,
+        normalize_line_feeds: ?*bool = null,
+        normalize_trailing_whitespace: ?*bool = null,
     },
 
     netconf: extern struct {
@@ -444,15 +446,15 @@ export fn ls_fetch_options_size(
 
     const allocator = ffi_common.getAllocator();
 
-    const opt_string = ffiOptionsToJSON(allocator, o) catch {
-        return 1;
+    const opt_string = ffiOptionsToJSON(allocator, o) catch |err| {
+        return ffi_common.toFfiResult(err);
     };
 
     defer allocator.free(opt_string);
 
     options_json_len.* = opt_string.len;
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
 }
 
 export fn ls_fetch_options(
@@ -463,15 +465,15 @@ export fn ls_fetch_options(
 
     const allocator = ffi_common.getAllocator();
 
-    const opt_string = ffiOptionsToJSON(allocator, o) catch {
-        return 1;
+    const opt_string = ffiOptionsToJSON(allocator, o) catch |err| {
+        return ffi_common.toFfiResult(err);
     };
 
     defer allocator.free(opt_string);
 
     @memcpy(options_json.*[0..], opt_string);
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
 }
 
 fn optU16(val: ?*const u16) ?u16 {
@@ -517,7 +519,9 @@ fn ffiOptionsTopLevelToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) 
 }
 
 const ffi_options_cli_args_json_ish_placeholder =
-    \\    "definition_str": "{s}"
+    \\    "definition_str": "{s}",
+    \\    "normalize_line_feeds": "{any}",
+    \\    "normalize_trailing_whitespace": "{any}"
 ;
 
 fn ffiOptionsCLIToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8 {
@@ -530,13 +534,18 @@ fn ffiOptionsCLIToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8
 
     const out_len = encoder.calcSize(raw.len);
     const encoded = try allocator.alloc(u8, out_len);
+    defer allocator.free(encoded);
 
     _ = encoder.encode(encoded, raw);
 
     return std.fmt.allocPrint(
         allocator,
         ffi_options_cli_args_json_ish_placeholder,
-        .{encoded},
+        .{
+            encoded,
+            optBool(o.cli.normalize_line_feeds),
+            optBool(o.cli.normalize_trailing_whitespace),
+        },
     );
 }
 

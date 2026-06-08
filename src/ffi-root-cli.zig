@@ -1,10 +1,10 @@
 // zlinter-disable no_panic - ignoring as we do panic on things that *really* should not happen
 const std = @import("std");
 
-const bytes = @import("bytes.zig");
 const cli = @import("cli.zig");
 const errors = @import("errors.zig");
 const ffi_args_to_options = @import("ffi-args-to-cli-options.zig");
+const ffi_common = @import("ffi-common.zig");
 const ffi_driver = @import("ffi-driver.zig");
 const ffi_operations = @import("ffi-operations.zig");
 
@@ -15,25 +15,25 @@ pub const noop = true;
 /// `ntc_template_platform` -- this slice should be pre populated w/ sufficient size (lets say
 /// 256?). while unused in zig, ntc templates platform is useful in python land.
 export fn ls_cli_get_ntc_templates_platform(
-    d_ptr: usize,
+    d_ptr: *ffi_common.LsDriver,
     ntc_template_platform: *[]u8,
 ) callconv(.c) u8 {
-    const d: *ffi_driver.FfiDriver = @ptrFromInt(d_ptr);
+    const d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
 
     switch (d.real_driver) {
         .cli => |rd| {
             if (rd.definition.ntc_templates_platform == null) {
-                return 0;
+                return @intFromEnum(ffi_common.FfiResult.success);
             }
 
             for (0.., rd.definition.ntc_templates_platform.?) |idx, char| {
                 ntc_template_platform.*[idx] = char;
             }
 
-            return 0;
+            return @intFromEnum(ffi_common.FfiResult.success);
         },
         else => {
-            return 1;
+            return @intFromEnum(ffi_common.FfiResult.invalid_argument);
         },
     }
 }
@@ -42,37 +42,35 @@ export fn ls_cli_get_ntc_templates_platform(
 /// `genie_platform` -- this slice should be pre populated w/ sufficient size (lets say
 /// 256?). while unused in zig, genie platform/parser is useful in python land.
 export fn ls_cli_get_genie_platform(
-    d_ptr: usize,
+    d_ptr: *ffi_common.LsDriver,
     genie_platform: *[]u8,
 ) callconv(.c) u8 {
-    const d: *ffi_driver.FfiDriver = @ptrFromInt(d_ptr);
+    const d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
 
     switch (d.real_driver) {
         .cli => |rd| {
             if (rd.definition.genie_platform == null) {
-                return 0;
+                return @intFromEnum(ffi_common.FfiResult.success);
             }
 
             for (0.., rd.definition.genie_platform.?) |idx, char| {
                 genie_platform.*[idx] = char;
             }
 
-            return 0;
+            return @intFromEnum(ffi_common.FfiResult.success);
         },
         else => {
-            return 1;
+            return @intFromEnum(ffi_common.FfiResult.invalid_argument);
         },
     }
-
-    return 0;
 }
 
 export fn ls_cli_open(
-    d_ptr: usize,
+    d_ptr: *ffi_common.LsDriver,
     operation_id: *u32,
     cancel: *bool,
 ) callconv(.c) u8 {
-    var d: *ffi_driver.FfiDriver = @ptrFromInt(d_ptr);
+    var d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
 
     d.open() catch |err| {
         // zlinter-disable-next-line no_swallow_error - returning status code for ffi ops
@@ -84,7 +82,7 @@ export fn ls_cli_open(
             .{err},
         ) catch {};
 
-        return 1;
+        return ffi_common.toFfiResult(err);
     };
 
     switch (d.real_driver) {
@@ -110,7 +108,7 @@ export fn ls_cli_open(
                     .{err},
                 ) catch {};
 
-                return 1;
+                return ffi_common.toFfiResult(err);
             };
         },
         .netconf => {
@@ -123,7 +121,7 @@ export fn ls_cli_open(
                 .{},
             ) catch {};
 
-            return 1;
+            return @intFromEnum(ffi_common.FfiResult.invalid_argument);
         },
     }
 
@@ -131,8 +129,8 @@ export fn ls_cli_open(
         // weve already waited for the operation loop to start in the queue operation function,
         // but we also need to ensure we wait for the open operation to actually get put into
         // the queue before continuing
-        d.operation_lock.lock(d.io) catch {
-            return 1;
+        d.operation_lock.lock(d.io) catch |err| {
+            return ffi_common.toFfiResult(err);
         };
         defer d.operation_lock.unlock(d.io);
 
@@ -155,15 +153,15 @@ export fn ls_cli_open(
         };
     }
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
 }
 
 export fn ls_cli_close(
-    d_ptr: usize,
+    d_ptr: *ffi_common.LsDriver,
     operation_id: *u32,
     cancel: *bool,
 ) callconv(.c) u8 {
-    var d: *ffi_driver.FfiDriver = @ptrFromInt(d_ptr);
+    var d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
 
     switch (d.real_driver) {
         .cli => {
@@ -188,7 +186,7 @@ export fn ls_cli_close(
                     .{err},
                 ) catch {};
 
-                return 1;
+                return ffi_common.toFfiResult(err);
             };
         },
         .netconf => {
@@ -201,15 +199,15 @@ export fn ls_cli_close(
                 .{},
             ) catch {};
 
-            return 1;
+            return @intFromEnum(ffi_common.FfiResult.invalid_argument);
         },
     }
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
 }
 
 export fn ls_cli_fetch_operation_sizes(
-    d_ptr: usize,
+    d_ptr: *ffi_common.LsDriver,
     operation_id: u32,
     operation_count: *u32,
     operation_input_size: *usize,
@@ -218,7 +216,7 @@ export fn ls_cli_fetch_operation_sizes(
     operation_failure_indicator_size: *usize,
     operation_error_size: *usize,
 ) callconv(.c) u8 {
-    var d: *ffi_driver.FfiDriver = @ptrFromInt(d_ptr);
+    var d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
 
     const ret = d.dequeueOperation(operation_id, false) catch |err| {
         // zlinter-disable-next-line no_swallow_error - returning status code for ffi ops
@@ -230,7 +228,7 @@ export fn ls_cli_fetch_operation_sizes(
             .{err},
         ) catch {};
 
-        return 1;
+        return ffi_common.toFfiResult(err);
     };
 
     if (ret.err != null) {
@@ -241,33 +239,34 @@ export fn ls_cli_fetch_operation_sizes(
     } else {
         const dret = switch (ret.result) {
             .cli => |r| r.?,
-            else => @panic("ffi: attempting to access non cli result from cli type"),
+            else => {
+                // zlinter-disable-next-line no_swallow_error - returning status code for ffi ops
+                errors.wrapCriticalError(
+                    errors.ScrapliError.Operation,
+                    @src(),
+                    d.getLogger(),
+                    "ffi: attempting to access non cli result from cli driver",
+                    .{},
+                ) catch {};
+
+                return @intFromEnum(ffi_common.FfiResult.invalid_argument);
+            },
         };
 
-        operation_count.* = @intCast(dret.results.items.len);
-
-        operation_input_size.* = dret.getInputLen(
-            .{ .delimiter = bytes.libscrapli_delimiter },
-        );
-        operation_result_raw_size.* = dret.getResultRawLen(
-            .{ .delimiter = bytes.libscrapli_delimiter },
-        );
-        operation_result_size.* = dret.getResultLen(
-            .{ .delimiter = bytes.libscrapli_delimiter },
-        );
-        operation_failure_indicator_size.* = 0;
+        const sizes = d.getCliResultLens(dret);
+        operation_count.* = @intCast(sizes.operation_count);
+        operation_input_size.* = sizes.operation_input_size;
+        operation_result_raw_size.* = sizes.operation_result_raw_size;
+        operation_result_size.* = sizes.operation_result_size;
+        operation_failure_indicator_size.* = sizes.operation_failure_indicator_size;
         operation_error_size.* = 0;
-
-        if (dret.result_failure_indicated) {
-            operation_failure_indicator_size.* = dret.failed_indicators.?.items[@intCast(dret.result_failure_indicator)].len;
-        }
     }
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
 }
 
 export fn ls_cli_fetch_operation(
-    d_ptr: usize,
+    d_ptr: *ffi_common.LsDriver,
     operation_id: u32,
     operation_start_time: *u64,
     operation_splits: *[]u64,
@@ -277,7 +276,7 @@ export fn ls_cli_fetch_operation(
     operation_result_failed_indicator: *[]u8,
     operation_error: *[]u8,
 ) callconv(.c) u8 {
-    var d: *ffi_driver.FfiDriver = @ptrFromInt(d_ptr);
+    var d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
 
     const ret = d.dequeueOperation(operation_id, true) catch |err| {
         // zlinter-disable-next-line no_swallow_error - returning status code for ffi ops
@@ -289,7 +288,7 @@ export fn ls_cli_fetch_operation(
             .{err},
         ) catch {};
 
-        return 1;
+        return ffi_common.toFfiResult(err);
     };
 
     defer {
@@ -309,85 +308,57 @@ export fn ls_cli_fetch_operation(
     } else {
         const dret = switch (ret.result) {
             .cli => |r| r.?,
-            else => @panic("ffi: attempting to access non cli result from cli type"),
+            else => {
+                // zlinter-disable-next-line no_swallow_error - returning status code for ffi ops
+                errors.wrapCriticalError(
+                    errors.ScrapliError.Operation,
+                    @src(),
+                    d.getLogger(),
+                    "ffi: attempting to access non cli result from cli driver",
+                    .{},
+                ) catch {};
+
+                return @intFromEnum(ffi_common.FfiResult.invalid_argument);
+            },
         };
 
-        if (dret.splits_ns.items.len > 0) {
-            operation_start_time.* = @intCast(dret.start_time_ns);
-            for (0.., dret.splits_ns.items) |idx, split| {
-                operation_splits.*[idx] = @intCast(split);
-            }
-        } else {
-            // was a noop -- like enterMode but where mode didn't change
-            operation_start_time.* = @intCast(dret.start_time_ns);
-        }
+        d.getCliResults(
+            dret,
+            operation_start_time,
+            operation_splits,
+            operation_input,
+            operation_result_raw,
+            operation_result,
+            operation_result_failed_indicator,
+            operation_error,
+        ) catch |err| {
+            // zlinter-disable-next-line no_swallow_error - returning status code for ffi ops
+            errors.wrapCriticalError(
+                errors.ScrapliError.Operation,
+                @src(),
+                d.getLogger(),
+                "ffi: error during fetch operation {any}",
+                .{err},
+            ) catch {};
 
-        // to avoid a pointless allocation since we are already copying from the result into the
-        // given string pointers, we'll do basically the same thing the result does in normal (zig)
-        // operations in getResult/getResultRaw by iterating over the underlying array list and
-        // copying from there, inserting newlines between results, into the given pointer(s)
-        var cur: usize = 0;
-
-        for (0.., dret.inputs.items) |idx, input| {
-            @memcpy(operation_input.*[cur .. cur + input.len], input);
-            cur += input.len;
-
-            if (idx != dret.inputs.items.len - 1) {
-                for (bytes.libscrapli_delimiter) |delimiter_char| {
-                    operation_input.*[cur] = delimiter_char;
-                    cur += 1;
-                }
-            }
-        }
-
-        cur = 0;
-
-        for (0.., dret.results_raw.items) |idx, result_raw| {
-            @memcpy(operation_result_raw.*[cur .. cur + result_raw.len], result_raw);
-            cur += result_raw.len;
-
-            if (idx != dret.results_raw.items.len - 1) {
-                for (bytes.libscrapli_delimiter) |delimiter_char| {
-                    operation_result_raw.*[cur] = delimiter_char;
-                    cur += 1;
-                }
-            }
-        }
-
-        cur = 0;
-
-        for (0.., dret.results.items) |idx, result| {
-            @memcpy(operation_result.*[cur .. cur + result.len], result);
-            cur += result.len;
-
-            if (idx != dret.results.items.len - 1) {
-                for (bytes.libscrapli_delimiter) |delimiter_char| {
-                    operation_result.*[cur] = delimiter_char;
-                    cur += 1;
-                }
-            }
-        }
-
-        if (dret.result_failure_indicated) {
-            @memcpy(
-                operation_result_failed_indicator.*,
-                dret.failed_indicators.?.items[@intCast(dret.result_failure_indicator)],
-            );
-        }
-
-        operation_error.* = "";
+            return ffi_common.toFfiResult(err);
+        };
     }
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
 }
 
 export fn ls_cli_enter_mode(
-    d_ptr: usize,
+    d_ptr: *ffi_common.LsDriver,
     operation_id: *u32,
     cancel: *bool,
     requested_mode: [*c]const u8,
 ) callconv(.c) u8 {
-    const d: *ffi_driver.FfiDriver = @ptrFromInt(d_ptr);
+    if (requested_mode == null) {
+        return @intFromEnum(ffi_common.FfiResult.invalid_argument);
+    }
+
+    const d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
 
     const _operation_id = d.queueOperation(
         ffi_operations.OperationOptions{
@@ -411,20 +382,20 @@ export fn ls_cli_enter_mode(
             .{err},
         ) catch {};
 
-        return 1;
+        return ffi_common.toFfiResult(err);
     };
 
     operation_id.* = _operation_id;
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
 }
 
 export fn ls_cli_get_prompt(
-    d_ptr: usize,
+    d_ptr: *ffi_common.LsDriver,
     operation_id: *u32,
     cancel: *bool,
 ) callconv(.c) u8 {
-    const d: *ffi_driver.FfiDriver = @ptrFromInt(d_ptr);
+    const d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
 
     const _operation_id = d.queueOperation(
         ffi_operations.OperationOptions{
@@ -447,16 +418,16 @@ export fn ls_cli_get_prompt(
             .{err},
         ) catch {};
 
-        return 1;
+        return ffi_common.toFfiResult(err);
     };
 
     operation_id.* = _operation_id;
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
 }
 
 export fn ls_cli_send_input(
-    d_ptr: usize,
+    d_ptr: *ffi_common.LsDriver,
     operation_id: *u32,
     cancel: *bool,
     input: [*c]const u8,
@@ -465,7 +436,11 @@ export fn ls_cli_send_input(
     retain_input: bool,
     retain_trailing_prompt: bool,
 ) callconv(.c) u8 {
-    const d: *ffi_driver.FfiDriver = @ptrFromInt(d_ptr);
+    if (input == null or requested_mode == null or input_handling == null) {
+        return @intFromEnum(ffi_common.FfiResult.invalid_argument);
+    }
+
+    const d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
 
     const options = ffi_args_to_options.sendInputOptionsFromArgs(
         cancel,
@@ -495,16 +470,71 @@ export fn ls_cli_send_input(
             .{err},
         ) catch {};
 
-        return 1;
+        return ffi_common.toFfiResult(err);
     };
 
     operation_id.* = _operation_id;
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
+}
+
+export fn ls_cli_send_inputs(
+    d_ptr: *ffi_common.LsDriver,
+    operation_id: *u32,
+    cancel: *bool,
+    // inputs delimited on the libscrapli delim... annoying but simple/dumb
+    inputs: [*c]const u8,
+    requested_mode: [*c]const u8,
+    input_handling: [*c]const u8,
+    retain_input: bool,
+    retain_trailing_prompt: bool,
+    stop_on_indicated_failure: bool,
+) callconv(.c) u8 {
+    if (inputs == null or requested_mode == null or input_handling == null) {
+        return @intFromEnum(ffi_common.FfiResult.invalid_argument);
+    }
+
+    const d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
+
+    const options = ffi_args_to_options.sendInputsOptionsFromArgs(
+        cancel,
+        inputs,
+        requested_mode,
+        input_handling,
+        retain_input,
+        retain_trailing_prompt,
+        stop_on_indicated_failure,
+    );
+
+    const _operation_id = d.queueOperation(
+        ffi_operations.OperationOptions{
+            .id = 0,
+            .operation = .{
+                .cli = .{
+                    .send_inputs = options,
+                },
+            },
+        },
+    ) catch |err| {
+        // zlinter-disable-next-line no_swallow_error - returning status code for ffi ops
+        errors.wrapCriticalError(
+            errors.ScrapliError.Operation,
+            @src(),
+            d.getLogger(),
+            "ffi: error during queue sendInputs {any}",
+            .{err},
+        ) catch {};
+
+        return ffi_common.toFfiResult(err);
+    };
+
+    operation_id.* = _operation_id;
+
+    return @intFromEnum(ffi_common.FfiResult.success);
 }
 
 export fn ls_cli_send_prompted_input(
-    d_ptr: usize,
+    d_ptr: *ffi_common.LsDriver,
     operation_id: *u32,
     cancel: *bool,
     input: [*c]const u8,
@@ -517,7 +547,18 @@ export fn ls_cli_send_prompted_input(
     hidden_response: bool,
     retain_trailing_prompt: bool,
 ) callconv(.c) u8 {
-    const d: *ffi_driver.FfiDriver = @ptrFromInt(d_ptr);
+    if (input == null or
+        prompt_exact == null or
+        prompt_pattern == null or
+        response == null or
+        abort_input == null or
+        requested_mode == null or
+        input_handling == null)
+    {
+        return @intFromEnum(ffi_common.FfiResult.invalid_argument);
+    }
+
+    const d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
 
     const options = ffi_args_to_options.sendPromptedInputOptionsFromArgs(
         cancel,
@@ -551,20 +592,20 @@ export fn ls_cli_send_prompted_input(
             .{err},
         ) catch {};
 
-        return 1;
+        return ffi_common.toFfiResult(err);
     };
 
     operation_id.* = _operation_id;
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
 }
 
 export fn ls_cli_read_any(
-    d_ptr: usize,
+    d_ptr: *ffi_common.LsDriver,
     operation_id: *u32,
     cancel: *bool,
 ) callconv(.c) u8 {
-    const d: *ffi_driver.FfiDriver = @ptrFromInt(d_ptr);
+    const d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
 
     const _operation_id = d.queueOperation(
         ffi_operations.OperationOptions{
@@ -587,12 +628,12 @@ export fn ls_cli_read_any(
             .{err},
         ) catch {};
 
-        return 1;
+        return ffi_common.toFfiResult(err);
     };
 
     operation_id.* = _operation_id;
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
 }
 
 export fn ls_cli_read_callback_should_execute(
@@ -603,6 +644,15 @@ export fn ls_cli_read_callback_should_execute(
     not_contains: [*c]const u8,
     execute: *bool,
 ) callconv(.c) u8 {
+    if (buf == null or
+        name == null or
+        contains == null or
+        contains_pattern == null or
+        not_contains == null)
+    {
+        return @intFromEnum(ffi_common.FfiResult.invalid_argument);
+    }
+
     var triggered_callbacks: std.ArrayList([]const u8) = .empty;
 
     const should_execute = cli.readCallbackShouldExecute(
@@ -617,8 +667,8 @@ export fn ls_cli_read_callback_should_execute(
         // over ffi), so yea... w/e this is zero allocation operation so just pass empty arraylist
         false,
         &triggered_callbacks,
-    ) catch {
-        return 1;
+    ) catch |err| {
+        return ffi_common.toFfiResult(err);
     };
 
     if (should_execute) {
@@ -627,5 +677,202 @@ export fn ls_cli_read_callback_should_execute(
         execute.* = false;
     }
 
-    return 0;
+    return @intFromEnum(ffi_common.FfiResult.success);
+}
+
+export fn ls_cli_replace_definition(
+    d_ptr: *ffi_common.LsDriver,
+    definition_string: [*c]const u8,
+) callconv(.c) u8 {
+    const d: *ffi_driver.FfiDriver = @ptrCast(@alignCast(d_ptr));
+
+    switch (d.real_driver) {
+        .cli => |rd| {
+            rd.replaceDefinition(
+                .{
+                    .string = std.mem.span(definition_string),
+                },
+            ) catch |err| {
+                return ffi_common.toFfiResult(err);
+            };
+
+            return @intFromEnum(ffi_common.FfiResult.success);
+        },
+        else => {
+            return @intFromEnum(ffi_common.FfiResult.invalid_argument);
+        },
+    }
+}
+
+test "ffi: ls_cli_enter_mode null requested_mode" {
+    var op_id: u32 = 0;
+    var cancel: bool = false;
+    const result = ls_cli_enter_mode(@ptrFromInt(0xDEADBEEF), &op_id, &cancel, null);
+    try std.testing.expectEqual(@intFromEnum(ffi_common.FfiResult.invalid_argument), result);
+}
+
+test "ffi: ls_cli_send_input null arguments" {
+    var op_id: u32 = 0;
+    var cancel: bool = false;
+
+    try std.testing.expectEqual(
+        @intFromEnum(ffi_common.FfiResult.invalid_argument),
+        ls_cli_send_input(
+            @ptrFromInt(0xDEADBEEF),
+            &op_id,
+            &cancel,
+            null,
+            "mode",
+            "fuzzy",
+            false,
+            false,
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @intFromEnum(ffi_common.FfiResult.invalid_argument),
+        ls_cli_send_input(
+            @ptrFromInt(0xDEADBEEF),
+            &op_id,
+            &cancel,
+            "input",
+            null,
+            "fuzzy",
+            false,
+            false,
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @intFromEnum(ffi_common.FfiResult.invalid_argument),
+        ls_cli_send_input(
+            @ptrFromInt(0xDEADBEEF),
+            &op_id,
+            &cancel,
+            "input",
+            "mode",
+            null,
+            false,
+            false,
+        ),
+    );
+}
+
+test "ffi: ls_cli_send_inputs null arguments" {
+    var op_id: u32 = 0;
+    var cancel: bool = false;
+
+    try std.testing.expectEqual(
+        @intFromEnum(ffi_common.FfiResult.invalid_argument),
+        ls_cli_send_inputs(
+            @ptrFromInt(0xDEADBEEF),
+            &op_id,
+            &cancel,
+            null,
+            "mode",
+            "fuzzy",
+            false,
+            false,
+            false,
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @intFromEnum(ffi_common.FfiResult.invalid_argument),
+        ls_cli_send_inputs(
+            @ptrFromInt(0xDEADBEEF),
+            &op_id,
+            &cancel,
+            "inputs",
+            null,
+            "fuzzy",
+            false,
+            false,
+            false,
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @intFromEnum(ffi_common.FfiResult.invalid_argument),
+        ls_cli_send_inputs(
+            @ptrFromInt(0xDEADBEEF),
+            &op_id,
+            &cancel,
+            "inputs",
+            "mode",
+            null,
+            false,
+            false,
+            false,
+        ),
+    );
+}
+
+test "ffi: ls_cli_send_prompted_input null arguments" {
+    var op_id: u32 = 0;
+    var cancel: bool = false;
+
+    try std.testing.expectEqual(
+        @intFromEnum(ffi_common.FfiResult.invalid_argument),
+        ls_cli_send_prompted_input(
+            @ptrFromInt(0xDEADBEEF),
+            &op_id,
+            &cancel,
+            null,
+            "exact",
+            "pattern",
+            "response",
+            "abort",
+            "mode",
+            "fuzzy",
+            false,
+            false,
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @intFromEnum(ffi_common.FfiResult.invalid_argument),
+        ls_cli_send_prompted_input(
+            @ptrFromInt(0xDEADBEEF),
+            &op_id,
+            &cancel,
+            "input",
+            null,
+            "pattern",
+            "response",
+            "abort",
+            "mode",
+            "fuzzy",
+            false,
+            false,
+        ),
+    );
+}
+
+test "ffi: ls_cli_read_callback_should_execute null arguments" {
+    var execute: bool = false;
+
+    try std.testing.expectEqual(
+        @intFromEnum(ffi_common.FfiResult.invalid_argument),
+        ls_cli_read_callback_should_execute(
+            null,
+            "name",
+            "contains",
+            "pattern",
+            "not_contains",
+            &execute,
+        ),
+    );
+
+    try std.testing.expectEqual(
+        @intFromEnum(ffi_common.FfiResult.invalid_argument),
+        ls_cli_read_callback_should_execute(
+            "buf",
+            null,
+            "contains",
+            "pattern",
+            "not_contains",
+            &execute,
+        ),
+    );
 }

@@ -1,6 +1,7 @@
 // zlinter-disable no_panic - ignoring as we do panic on things that *really* should not happen
 const std = @import("std");
 
+const bytes = @import("bytes.zig");
 const cli = @import("cli.zig");
 const errors = @import("errors.zig");
 const ffi_operations = @import("ffi-operations.zig");
@@ -27,7 +28,7 @@ pub const FfiDriver = struct {
 
     real_driver: RealDriver,
 
-    poll_fds: [2]std.posix.fd_t = .{ 0, 0 },
+    poll_fds: [2]std.posix.fd_t = .{ -1, -1 },
 
     operation_id_counter: u32,
     operation_thread: ?std.Thread,
@@ -44,6 +45,10 @@ pub const FfiDriver = struct {
         u32,
         ffi_operations.OperationResult,
     ),
+
+    cli_get_results_options: result.GetResultOptions = .{
+        .delimiter = bytes.libscrapli_delimiter,
+    },
 
     fn setPollFds(self: *FfiDriver) !void {
         switch (std.posix.errno(std.c.pipe(&self.poll_fds))) {
@@ -63,18 +68,24 @@ pub const FfiDriver = struct {
         host: []const u8,
         config: cli.Config,
     ) !*FfiDriver {
-        const ffi_driver = try allocator.create(FfiDriver);
+        const real_driver = try cli.Driver.init(
+            allocator,
+            io,
+            host,
+            config,
+        );
+
+        const ffi_driver = allocator.create(FfiDriver) catch |err| {
+            real_driver.deinit();
+
+            return err;
+        };
 
         ffi_driver.* = FfiDriver{
             .allocator = allocator,
             .io = io,
-            .real_driver = RealDriver{
-                .cli = try cli.Driver.init(
-                    allocator,
-                    io,
-                    host,
-                    config,
-                ),
+            .real_driver = .{
+                .cli = real_driver,
             },
             .operation_id_counter = 0,
             .operation_thread = null,
@@ -92,6 +103,8 @@ pub const FfiDriver = struct {
                 ffi_operations.OperationResult,
             ).init(allocator),
         };
+
+        errdefer ffi_driver.deinit();
 
         try ffi_driver.setPollFds();
 
@@ -105,18 +118,24 @@ pub const FfiDriver = struct {
         host: []const u8,
         config: netconf.Config,
     ) !*FfiDriver {
-        const ffi_driver = try allocator.create(FfiDriver);
+        const real_driver = try netconf.Driver.init(
+            allocator,
+            io,
+            host,
+            config,
+        );
+
+        const ffi_driver = allocator.create(FfiDriver) catch |err| {
+            real_driver.deinit();
+
+            return err;
+        };
 
         ffi_driver.* = FfiDriver{
             .allocator = allocator,
             .io = io,
-            .real_driver = RealDriver{
-                .netconf = try netconf.Driver.init(
-                    allocator,
-                    io,
-                    host,
-                    config,
-                ),
+            .real_driver = .{
+                .netconf = real_driver,
             },
             .operation_id_counter = 0,
             .operation_thread = null,
@@ -135,6 +154,8 @@ pub const FfiDriver = struct {
             ).init(allocator),
         };
 
+        errdefer ffi_driver.deinit();
+
         try ffi_driver.setPollFds();
 
         return ffi_driver;
@@ -142,7 +163,6 @@ pub const FfiDriver = struct {
 
     /// Deinitialize the FfiDriver and its underlying "real" driver.
     pub fn deinit(self: *FfiDriver) void {
-        // store the stop signal before signaling the operation thread to iterate
         self.operation_stop.store(true, std.builtin.AtomicOrder.unordered);
 
         // signal to the operation thread to iterate, it should then catch the stored stop condition
@@ -153,6 +173,22 @@ pub const FfiDriver = struct {
 
         if (self.operation_thread) |ot| {
             ot.join();
+        }
+
+        var operation_results_iter = self.operation_results.iterator();
+        while (operation_results_iter.next()) |entry| {
+            switch (entry.value_ptr.*.result) {
+                .cli => |r| {
+                    if (r) |result_ptr| {
+                        result_ptr.deinit();
+                    }
+                },
+                .netconf => |r| {
+                    if (r) |result_ptr| {
+                        result_ptr.deinit();
+                    }
+                },
+            }
         }
 
         self.operation_queue.deinit();
@@ -167,9 +203,13 @@ pub const FfiDriver = struct {
             },
         }
 
-        // close the ffi layer poll fds
-        _ = std.c.close(self.poll_fds[0]);
-        _ = std.c.close(self.poll_fds[1]);
+        if (self.poll_fds[0] >= 0) {
+            _ = std.c.close(self.poll_fds[0]);
+        }
+
+        if (self.poll_fds[1] >= 0) {
+            _ = std.c.close(self.poll_fds[1]);
+        }
 
         self.allocator.destroy(self);
     }
@@ -294,11 +334,7 @@ pub const FfiDriver = struct {
 
             const rd = switch (self.real_driver) {
                 .cli => |d| d,
-                else => {
-                    @panic(
-                        "ffi-driver.FfiDriver: cli operation loop executed, but driver is not cli",
-                    );
-                },
+                else => unreachable,
             };
 
             switch (op.?.operation.cli) {
@@ -340,6 +376,15 @@ pub const FfiDriver = struct {
                 },
                 .send_input => |o| {
                     ret_ok = rd.sendInput(
+                        self.allocator,
+                        o,
+                    ) catch |err| blk: {
+                        ret_err = err;
+                        break :blk null;
+                    };
+                },
+                .send_inputs => |o| {
+                    ret_ok = rd.sendInputs(
                         self.allocator,
                         o,
                     ) catch |err| blk: {
@@ -452,12 +497,7 @@ pub const FfiDriver = struct {
 
             const rd = switch (self.real_driver) {
                 .netconf => |d| d,
-                else => {
-                    @panic(
-                        "ffi-driver.FfiDriver: netconf operation loop executed, " ++
-                            "but driver is not netconf",
-                    );
-                },
+                else => unreachable,
             };
 
             switch (op.?.operation.netconf) {
@@ -774,5 +814,101 @@ pub const FfiDriver = struct {
         }
 
         return ret.?;
+    }
+
+    /// A conveinence function to get result sizes for cli operations -- shimmed in so we can ensure
+    /// that we do *not* process line endings for read any operations.
+    pub fn getCliResultLens(
+        self: *FfiDriver,
+        r: *result.Result,
+    ) ffi_operations.CliOperationSizes {
+        const get_options = self.getCliResultOptions(r);
+
+        var sizes = ffi_operations.CliOperationSizes{
+            .operation_count = r.results.items.len,
+            .operation_input_size = r.getInputLen(get_options),
+            .operation_result_raw_size = r.getResultRawLen(get_options),
+            .operation_result_size = r.getResultLen(get_options),
+            .operation_failure_indicator_size = 0,
+        };
+
+        if (r.result_failure_indicator >= 0) {
+            const failure_size = r.failed_indicators.?.items[@intCast(r.result_failure_indicator)].len;
+            sizes.operation_failure_indicator_size = failure_size;
+        }
+
+        return sizes;
+    }
+
+    /// A conveinence function to get results for cli operations.
+    pub fn getCliResults(
+        self: *FfiDriver,
+        r: *result.Result,
+        operation_start_time: *u64,
+        operation_splits: *[]u64,
+        operation_input: *[]u8,
+        operation_result_raw: *[]u8,
+        operation_result: *[]u8,
+        operation_result_failed_indicator: *[]u8,
+        operation_error: *[]u8,
+    ) !void {
+        const get_options = self.getCliResultOptions(r);
+
+        if (r.splits_ns.items.len > 0) {
+            operation_start_time.* = @intCast(r.start_time_ns);
+            for (0.., r.splits_ns.items) |idx, split| {
+                operation_splits.*[idx] = @intCast(split);
+            }
+        } else {
+            // was a noop -- like enterMode but where mode didn't change
+            operation_start_time.* = @intCast(r.start_time_ns);
+        }
+
+        // to avoid a pointless allocation since we are already copying from the result into the
+        // given string pointers, we'll do basically the same thing the result does in normal (zig)
+        // operations in getResult/getResultRaw by iterating over the underlying array list and
+        // copying from there, inserting newlines between results, into the given pointer(s)
+        var cur: usize = 0;
+
+        for (0.., r.inputs.items) |idx, input| {
+            @memcpy(operation_input.*[cur .. cur + input.len], input);
+            cur += input.len;
+
+            if (idx != r.inputs.items.len - 1) {
+                for (bytes.libscrapli_delimiter) |delimiter_char| {
+                    operation_input.*[cur] = delimiter_char;
+                    cur += 1;
+                }
+            }
+        }
+
+        try r.getResultRawPreAllocated(operation_result_raw.*, get_options);
+        try r.getResultPreAllocated(operation_result.*, get_options);
+
+        if (r.result_failure_indicated) {
+            @memcpy(
+                operation_result_failed_indicator.*,
+                r.failed_indicators.?.items[@intCast(r.result_failure_indicator)],
+            );
+        }
+
+        operation_error.* = "";
+    }
+
+    fn getCliResultOptions(
+        self: *FfiDriver,
+        r: *result.Result,
+    ) result.GetResultOptions {
+        // zlinter-disable require_exhaustive_enum_switch
+        return switch (r.operation_kind) {
+            // read any is bypassing "normal" things so we never want to process line ends
+            // or anything like that since that will almost certainly be unexpected for users
+            .read_any => .{
+                .delimiter = bytes.libscrapli_delimiter,
+                .normalize_line_feeds = false,
+                .normalize_trailing_whitespace = false,
+            },
+            else => self.cli_get_results_options,
+        };
     }
 };

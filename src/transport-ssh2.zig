@@ -1,5 +1,8 @@
 const std = @import("std");
 
+const c = @import("c");
+const ssh2 = @import("ssh2");
+
 const auth = @import("auth.zig");
 const errors = @import("errors.zig");
 const file = @import("file.zig");
@@ -7,25 +10,13 @@ const logging = @import("logging.zig");
 const transport_socket = @import("transport-socket.zig");
 const transport_waiter = @import("transport-waiter.zig");
 
-const c = @cImport(
-    {
-        @cDefine("_XOPEN_SOURCE", "500");
-        @cInclude("sys/socket.h");
-        @cInclude("stdlib.h");
-        @cInclude("libssh2.h");
-    },
-);
-
 const default_eagain_delay_ns: u64 = 100_000;
 
 var ssh2_initialized = false;
 
 fn libssh2InitializeOnce() c_int {
     if (!ssh2_initialized) {
-        // 0 is normal initialization, only other thing we can do here is tell it to *not*
-        // initialize crypto libraries, which we obviously want it to be doing, so just pass 0
-        const rc = c.libssh2_init(0);
-
+        const rc = ssh2.libssh2_init(0);
         if (rc != 0) {
             return rc;
         }
@@ -36,28 +27,26 @@ fn libssh2InitializeOnce() c_int {
     return 0;
 }
 
-// translate the untranslatable macro bits in the libssh2 upstream
-// https://ziggit.dev/t/libssh2-issue/7020
-fn libssh2ChannelOpenSession(session: ?*c.LIBSSH2_SESSION) ?*c.LIBSSH2_CHANNEL {
+fn libssh2ChannelOpenSession(session: ?*ssh2.LIBSSH2_SESSION) ?*ssh2.LIBSSH2_CHANNEL {
     const channel_type = "session";
 
-    return c.libssh2_channel_open_ex(
+    return ssh2.libssh2_channel_open_ex(
         session,
         channel_type.ptr,
         channel_type.len,
-        c.LIBSSH2_CHANNEL_WINDOW_DEFAULT,
-        c.LIBSSH2_CHANNEL_PACKET_DEFAULT,
+        ssh2.LIBSSH2_CHANNEL_WINDOW_DEFAULT,
+        ssh2.LIBSSH2_CHANNEL_PACKET_DEFAULT,
         null,
         0,
     );
 }
 
 fn libssh2ChannelOpenProxySession(
-    session: ?*c.LIBSSH2_SESSION,
+    session: ?*ssh2.LIBSSH2_SESSION,
     host: [:0]u8,
     port: c_int,
-) ?*c.LIBSSH2_CHANNEL {
-    return c.libssh2_channel_direct_tcpip_ex(
+) ?*ssh2.LIBSSH2_CHANNEL {
+    return ssh2.libssh2_channel_direct_tcpip_ex(
         session,
         host,
         port,
@@ -66,34 +55,31 @@ fn libssh2ChannelOpenProxySession(
     );
 }
 
-// another untranslatable macro one
-fn libssh2ChannelRequestPty(channel: ?*c.LIBSSH2_CHANNEL) c_int {
+fn libssh2ChannelRequestPty(channel: ?*ssh2.LIBSSH2_CHANNEL) c_int {
     const term_type = "xterm";
-
-    // this seems to have no affect on at least on iosxe test box but... want to have echo
-    // enabled always (servers can allegedly not honor this though...)
-    // see rfc4254
     const term_modes = [_]u8{
-        53, // echo
-        0, 0, 0, 1, // uint32 (four bytes) set to 1 for enable
-        0, // end modes
+        53,
+        0,
+        0,
+        0,
+        1,
+        0,
     };
 
-    return c.libssh2_channel_request_pty_ex(
+    return ssh2.libssh2_channel_request_pty_ex(
         channel,
         term_type.ptr,
         term_type.len,
         &term_modes[0],
         term_modes.len,
-        c.LIBSSH2_TERM_WIDTH,
-        c.LIBSSH2_TERM_HEIGHT,
-        c.LIBSSH2_TERM_WIDTH_PX,
-        c.LIBSSH2_TERM_HEIGHT_PX,
+        ssh2.LIBSSH2_TERM_WIDTH,
+        ssh2.LIBSSH2_TERM_HEIGHT,
+        ssh2.LIBSSH2_TERM_WIDTH_PX,
+        ssh2.LIBSSH2_TERM_HEIGHT_PX,
     );
 }
 
-// another untranslatable macro one
-fn libssh2ChannelProcessStartup(channel: ?*c.LIBSSH2_CHANNEL, netconf: bool) c_int {
+fn libssh2ChannelProcessStartup(channel: ?*ssh2.LIBSSH2_CHANNEL, netconf: bool) c_int {
     var request: []const u8 = "shell";
     var message: [*c]const u8 = null;
     var message_len: usize = 0;
@@ -104,7 +90,7 @@ fn libssh2ChannelProcessStartup(channel: ?*c.LIBSSH2_CHANNEL, netconf: bool) c_i
         message_len = 7;
     }
 
-    return c.libssh2_channel_process_startup(
+    return ssh2.libssh2_channel_process_startup(
         channel,
         request.ptr,
         @intCast(request.len),
@@ -115,17 +101,17 @@ fn libssh2ChannelProcessStartup(channel: ?*c.LIBSSH2_CHANNEL, netconf: bool) c_i
 
 fn libssh2DisconnectSession(
     io: std.Io,
-    session: ?*c.LIBSSH2_SESSION,
+    session: ?*ssh2.LIBSSH2_SESSION,
     log: logging.Logger,
 ) void {
     var counter: usize = 0;
 
     while (true) {
-        const rc = c.libssh2_session_disconnect(session, "closing");
+        const rc = ssh2.libssh2_session_disconnect(session, "closing");
 
         if (rc == 0) {
             break;
-        } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+        } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
             counter += 1;
 
             if (counter > 25) {
@@ -155,17 +141,17 @@ fn libssh2DisconnectSession(
 
 fn libssh2FreeSession(
     io: std.Io,
-    session: ?*c.LIBSSH2_SESSION,
+    session: ?*ssh2.LIBSSH2_SESSION,
     log: logging.Logger,
 ) void {
     var counter: usize = 0;
 
     while (true) {
-        const rc = c.libssh2_session_free(session);
+        const rc = ssh2.libssh2_session_free(session);
 
         if (rc == 0) {
             break;
-        } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+        } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
             counter += 1;
 
             if (counter > 25) {
@@ -195,17 +181,17 @@ fn libssh2FreeSession(
 
 fn libssh2CloseChannel(
     io: std.Io,
-    chan: ?*c.LIBSSH2_CHANNEL,
+    chan: ?*ssh2.LIBSSH2_CHANNEL,
     log: logging.Logger,
 ) void {
     var counter: usize = 0;
 
     while (true) {
-        const rc = c.libssh2_channel_close(chan);
+        const rc = ssh2.libssh2_channel_close(chan);
 
         if (rc == 0) {
             break;
-        } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+        } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
             counter += 1;
 
             if (counter > 250) {
@@ -235,17 +221,17 @@ fn libssh2CloseChannel(
 
 fn libssh2FreeChannel(
     io: std.Io,
-    chan: ?*c.LIBSSH2_CHANNEL,
+    chan: ?*ssh2.LIBSSH2_CHANNEL,
     log: logging.Logger,
 ) void {
     var counter: usize = 0;
 
     while (true) {
-        const rc = c.libssh2_channel_free(chan);
+        const rc = ssh2.libssh2_channel_free(chan);
 
         if (rc == 0) {
             break;
-        } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+        } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
             counter += 1;
 
             if (counter > 250) {
@@ -282,7 +268,7 @@ const ProxyWrapper = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     log: logging.Logger,
-    channel: ?*c.LIBSSH2_CHANNEL = null,
+    channel: ?*ssh2.LIBSSH2_CHANNEL = null,
     remote_fd: c_int = 0,
     stop_flag: std.atomic.Value(bool),
     pipe_to_channel_thread: ?std.Thread = null,
@@ -316,7 +302,7 @@ const ProxyWrapper = struct {
     /// session and the proxied one.
     pub fn run(
         self: *ProxyWrapper,
-        channel: *c.LIBSSH2_CHANNEL,
+        channel: *ssh2.LIBSSH2_CHANNEL,
         remote_fd: c_int,
     ) !void {
         self.channel = channel;
@@ -362,9 +348,9 @@ const ProxyWrapper = struct {
             return errors.ScrapliError.EOF;
         }
 
-        const rc = c.libssh2_channel_write_ex(self.channel, 0, buf[0..n].ptr, n);
+        const rc = ssh2.libssh2_channel_write_ex(self.channel, 0, buf[0..n].ptr, n);
 
-        if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+        if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
             return error.WouldBlock;
         } else if (rc < 0) {
             return errors.wrapCriticalError(
@@ -401,10 +387,10 @@ const ProxyWrapper = struct {
     ) !void {
         var buf: [4096]u8 = undefined;
 
-        const n = c.libssh2_channel_read(self.channel, buf[0..].ptr, 4096);
+        const n = ssh2.libssh2_channel_read(self.channel, buf[0..].ptr, 4096);
         if (n == 0) {
-            return;
-        } else if (n == c.LIBSSH2_ERROR_EAGAIN) {
+            return errors.ScrapliError.EOF;
+        } else if (n == ssh2.LIBSSH2_ERROR_EAGAIN) {
             return error.WouldBlock;
         } else if (n < 0) {
             return errors.wrapCriticalError(
@@ -417,17 +403,35 @@ const ProxyWrapper = struct {
         }
 
         var wrote: usize = 0;
+        const total: usize = @intCast(n);
 
-        while (true) {
-            const wrote_n: usize = @intCast(
-                std.c.write(self.remote_fd, buf[0..@intCast(n)].ptr, @intCast(n)),
+        while (wrote < total) {
+            const rc = std.c.write(
+                self.remote_fd,
+                buf[wrote..total].ptr,
+                total - wrote,
             );
 
-            wrote += wrote_n;
-
-            if (wrote == n) {
-                return;
+            if (rc < 0) {
+                const err = std.posix.errno(rc);
+                if (err == .AGAIN) {
+                    return error.WouldBlock;
+                }
+                return errors.wrapCriticalError(
+                    std.posix.unexpectedErrno(err),
+                    @src(),
+                    self.log,
+                    "channelToPipe: write to remote fd failed",
+                    .{},
+                );
             }
+
+            const wrote_n: usize = @intCast(rc);
+            if (wrote_n == 0) {
+                return error.WouldBlock;
+            }
+
+            wrote += wrote_n;
         }
     }
 
@@ -442,9 +446,9 @@ const ProxyWrapper = struct {
                         },
                         self.io,
                     );
-
                     continue;
                 },
+                errors.ScrapliError.EOF => return,
                 else => return err,
             };
         }
@@ -517,15 +521,16 @@ pub const Transport = struct {
     session_lock: std.Io.Mutex,
 
     // may be to the actual host or to the jumphost
+    stream: ?std.Io.net.Stream = null,
     socket: ?std.posix.socket_t = null,
 
     // the session/channel to the host in normal operation, or to the "initial" host in proxy jump
     // operations
-    initial_session: ?*c.LIBSSH2_SESSION = null,
-    initial_channel: ?*c.LIBSSH2_CHANNEL = null,
+    initial_session: ?*ssh2.LIBSSH2_SESSION = null,
+    initial_channel: ?*ssh2.LIBSSH2_CHANNEL = null,
 
-    proxy_session: ?*c.LIBSSH2_SESSION = null,
-    proxy_channel: ?*c.LIBSSH2_CHANNEL = null,
+    proxy_session: ?*ssh2.LIBSSH2_SESSION = null,
+    proxy_channel: ?*ssh2.LIBSSH2_CHANNEL = null,
     proxy_wrapper: ?*ProxyWrapper = null,
 
     /// Initializes the transport.
@@ -549,8 +554,13 @@ pub const Transport = struct {
         }
 
         const t = try allocator.create(Transport);
+        errdefer allocator.destroy(t);
+
         const a = try allocator.create(AuthCallbackData);
+        errdefer allocator.destroy(a);
+
         const pa = try allocator.create(AuthCallbackData);
+        errdefer allocator.destroy(pa);
 
         a.* = AuthCallbackData{};
         pa.* = AuthCallbackData{};
@@ -573,8 +583,8 @@ pub const Transport = struct {
     pub fn deinit(self: *Transport) void {
         logging.traceWithSrc(self.log, @src(), "ssh2.Transport deinitializing", .{});
 
-        if (self.proxy_session != null) {
-            libssh2FreeSession(self.io, self.proxy_session, self.log);
+        if (self.proxy_session) |proxy_session| {
+            libssh2FreeSession(self.io, proxy_session, self.log);
         }
 
         if (self.initial_channel) |chan| {
@@ -631,7 +641,7 @@ pub const Transport = struct {
 
         self.log.info("ssh2.Transport open: authentication complete", .{});
 
-        var channel: ?*c.LIBSSH2_CHANNEL = null;
+        var channel: ?*ssh2.LIBSSH2_CHANNEL = null;
 
         if (self.options.proxy_jump_options == null) {
             // no proxy jump, normal flow
@@ -700,18 +710,20 @@ pub const Transport = struct {
     ) !void {
         self.log.debug("ssh2.Transport initSocket requested", .{});
 
-        const stream = transport_socket.getStream(self.io, host, port) catch {
+        self.stream = transport_socket.getStream(self.io, self.log, host, port) catch {
             return errors.wrapCriticalError(
                 errors.ScrapliError.Transport,
                 @src(),
                 self.log,
                 "ssh2.Transport initSocket: failed initializing socket, " ++
-                    "unable to resolve host",
-                .{},
+                    "unable to resolve host '{s}'",
+                .{host},
             );
         };
 
-        self.socket = stream.socket.handle;
+        if (self.stream) |stream| {
+            self.socket = stream.socket.handle;
+        }
     }
 
     fn initSession(
@@ -722,7 +734,7 @@ pub const Transport = struct {
     ) !void {
         self.log.debug("ssh2.Transport initSession requested", .{});
 
-        self.initial_session = c.libssh2_session_init_ex(
+        self.initial_session = ssh2.libssh2_session_init_ex(
             null,
             null,
             null,
@@ -739,19 +751,19 @@ pub const Transport = struct {
         }
 
         // set blocking status (0 non-block, 1 block)
-        c.libssh2_session_set_blocking(self.initial_session, 0);
+        ssh2.libssh2_session_set_blocking(self.initial_session, 0);
 
         if (self.options.libssh2_trace) {
             // best effort, but probably wont fail anyway :p
-            _ = c.libssh2_trace(
+            _ = ssh2.libssh2_trace(
                 self.initial_session,
-                c.LIBSSH2_TRACE_PUBLICKEY |
-                    c.LIBSSH2_TRACE_CONN |
-                    c.LIBSSH2_TRACE_ERROR |
-                    c.LIBSSH2_TRACE_SOCKET |
-                    c.LIBSSH2_TRACE_TRANS |
-                    c.LIBSSH2_TRACE_KEX |
-                    c.LIBSSH2_TRACE_AUTH,
+                ssh2.LIBSSH2_TRACE_PUBLICKEY |
+                    ssh2.LIBSSH2_TRACE_CONN |
+                    ssh2.LIBSSH2_TRACE_ERROR |
+                    ssh2.LIBSSH2_TRACE_SOCKET |
+                    ssh2.LIBSSH2_TRACE_TRANS |
+                    ssh2.LIBSSH2_TRACE_KEX |
+                    ssh2.LIBSSH2_TRACE_AUTH,
             );
         }
 
@@ -778,14 +790,14 @@ pub const Transport = struct {
                 );
             }
 
-            const rc = c.libssh2_session_handshake(
+            const rc = ssh2.libssh2_session_handshake(
                 self.initial_session,
                 self.socket.?,
             );
 
             if (rc == 0) {
                 break;
-            } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+            } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
                 try std.Io.Clock.Duration.sleep(
                     .{
                         .clock = .awake,
@@ -828,7 +840,7 @@ pub const Transport = struct {
         );
         defer self.allocator.free(_known_hosts_path);
 
-        const nh = c.libssh2_knownhost_init(self.initial_session.?);
+        const nh = ssh2.libssh2_knownhost_init(self.initial_session.?);
         if (nh == null) {
             return errors.wrapCriticalError(
                 errors.ScrapliError.Transport,
@@ -838,12 +850,12 @@ pub const Transport = struct {
                 .{},
             );
         }
-        defer c.libssh2_knownhost_free(nh);
+        defer ssh2.libssh2_knownhost_free(nh);
 
-        const read_rc = c.libssh2_knownhost_readfile(
+        const read_rc = ssh2.libssh2_knownhost_readfile(
             nh,
             _known_hosts_path,
-            c.LIBSSH2_KNOWNHOST_FILE_OPENSSH,
+            ssh2.LIBSSH2_KNOWNHOST_FILE_OPENSSH,
         );
         if (read_rc < 0) {
             return errors.wrapCriticalError(
@@ -858,7 +870,7 @@ pub const Transport = struct {
         var len: usize = 0;
         var key_type: c_int = 0;
 
-        const host_fingerprint = c.libssh2_session_hostkey(
+        const host_fingerprint = ssh2.libssh2_session_hostkey(
             self.initial_session.?,
             &len,
             &key_type,
@@ -873,23 +885,23 @@ pub const Transport = struct {
             );
         }
 
-        var known_host: ?*c.libssh2_knownhost = null;
+        var known_host: ?*ssh2.libssh2_knownhost = null;
 
-        const check_rc = c.libssh2_knownhost_checkp(
+        const check_rc = ssh2.libssh2_knownhost_checkp(
             nh,
             _host,
             port,
             host_fingerprint,
             len,
-            c.LIBSSH2_KNOWNHOST_TYPE_PLAIN | c.LIBSSH2_KNOWNHOST_KEYENC_RAW,
+            ssh2.LIBSSH2_KNOWNHOST_TYPE_PLAIN | ssh2.LIBSSH2_KNOWNHOST_KEYENC_RAW,
             &known_host,
         );
 
         switch (check_rc) {
-            c.LIBSSH2_KNOWNHOST_CHECK_MATCH => {
+            ssh2.LIBSSH2_KNOWNHOST_CHECK_MATCH => {
                 return;
             },
-            c.LIBSSH2_KNOWNHOST_CHECK_MISMATCH => {
+            ssh2.LIBSSH2_KNOWNHOST_CHECK_MISMATCH => {
                 return errors.wrapCriticalError(
                     errors.ScrapliError.Transport,
                     @src(),
@@ -898,7 +910,7 @@ pub const Transport = struct {
                     .{},
                 );
             },
-            c.LIBSSH2_KNOWNHOST_CHECK_NOTFOUND => {
+            ssh2.LIBSSH2_KNOWNHOST_CHECK_NOTFOUND => {
                 return errors.wrapCriticalError(
                     errors.ScrapliError.Transport,
                     @src(),
@@ -907,7 +919,7 @@ pub const Transport = struct {
                     .{},
                 );
             },
-            c.LIBSSH2_KNOWNHOST_CHECK_FAILURE => {
+            ssh2.LIBSSH2_KNOWNHOST_CHECK_FAILURE => {
                 return errors.wrapCriticalError(
                     errors.ScrapliError.Transport,
                     @src(),
@@ -933,7 +945,7 @@ pub const Transport = struct {
         start_time: std.Io.Timestamp,
         cancel: ?*bool,
         operation_timeout_ns: u64,
-        session: *c.LIBSSH2_SESSION,
+        session: *ssh2.LIBSSH2_SESSION,
         auth_options: *auth.Options,
     ) !void {
         self.log.debug("ssh2.Transport authenticate requested", .{});
@@ -1034,7 +1046,7 @@ pub const Transport = struct {
         start_time: std.Io.Timestamp,
         cancel: ?*bool,
         operation_timeout_ns: u64,
-        session: *c.LIBSSH2_SESSION,
+        session: *ssh2.LIBSSH2_SESSION,
     ) !bool {
         while (true) {
             if (cancel != null and cancel.?.*) {
@@ -1057,12 +1069,12 @@ pub const Transport = struct {
                 );
             }
 
-            const rc = c.libssh2_userauth_authenticated(session);
+            const rc = ssh2.libssh2_userauth_authenticated(session);
 
             // 1 for auth, 0 for not, including EAGAIN just in case, but unclear if needed
             if (rc == 1) {
                 return true;
-            } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+            } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
                 try std.Io.Clock.Duration.sleep(
                     .{
                         .clock = .awake,
@@ -1083,7 +1095,7 @@ pub const Transport = struct {
         start_time: std.Io.Timestamp,
         cancel: ?*bool,
         operation_timeout_ns: u64,
-        session: *c.LIBSSH2_SESSION,
+        session: *ssh2.LIBSSH2_SESSION,
         auth_options: *auth.Options,
     ) !void {
         const private_key_path_c = try self.allocator.dupeSentinel(
@@ -1126,11 +1138,13 @@ pub const Transport = struct {
             // -16 rc == "file" (bad file path or perms or something)
             // -18 rc == "failed" (key auth not supported)
             // -19 rc == "unverified" (auth failed)
-            const rc = c.libssh2_userauth_publickey_fromfile_ex(
+            const username = auth_options.username.?;
+
+            const rc = ssh2.libssh2_userauth_publickey_fromfile_ex(
                 session,
                 // don't need to null terminate because we pass len
-                @ptrCast(@constCast(auth_options.username.?)),
-                @intCast(auth_options.username.?.len),
+                @ptrCast(@constCast(username)),
+                @intCast(username.len),
                 null, // would be public key if not using openssl as libssh2 crypto engine
                 private_key_path_c.ptr,
                 private_key_passphrase_c.ptr,
@@ -1138,7 +1152,7 @@ pub const Transport = struct {
 
             if (rc == 0) {
                 break;
-            } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+            } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
                 try std.Io.Clock.Duration.sleep(
                     .{
                         .clock = .awake,
@@ -1154,7 +1168,7 @@ pub const Transport = struct {
             var errlen: c_int = 0;
 
             // 0 => do not clear the error
-            const err: c_int = c.libssh2_session_last_error(
+            const err: c_int = ssh2.libssh2_session_last_error(
                 session,
                 &errmsg,
                 &errlen,
@@ -1182,7 +1196,7 @@ pub const Transport = struct {
         start_time: std.Io.Timestamp,
         cancel: ?*bool,
         operation_timeout_ns: u64,
-        session: *c.LIBSSH2_SESSION,
+        session: *ssh2.LIBSSH2_SESSION,
         auth_options: *auth.Options,
     ) !void {
         const private_key_passphrase_c = try self.allocator.dupeSentinel(
@@ -1217,10 +1231,12 @@ pub const Transport = struct {
                 );
             }
 
-            const rc = c.libssh2_userauth_publickey_frommemory(
+            const username = auth_options.username.?;
+
+            const rc = ssh2.libssh2_userauth_publickey_frommemory(
                 session,
-                @ptrCast(@constCast(auth_options.username.?)),
-                auth_options.username.?.len,
+                @ptrCast(@constCast(username)),
+                username.len,
                 null, // public key data (derived by openssl backend)
                 0,
                 @ptrCast(@constCast(key_content)),
@@ -1230,7 +1246,7 @@ pub const Transport = struct {
 
             if (rc == 0) {
                 break;
-            } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+            } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
                 try std.Io.Clock.Duration.sleep(
                     .{
                         .clock = .awake,
@@ -1246,7 +1262,7 @@ pub const Transport = struct {
             var errlen: c_int = 0;
 
             // 0 => do not clear the error
-            const err: c_int = c.libssh2_session_last_error(
+            const err: c_int = ssh2.libssh2_session_last_error(
                 session,
                 &errmsg,
                 &errlen,
@@ -1274,7 +1290,7 @@ pub const Transport = struct {
         start_time: std.Io.Timestamp,
         cancel: ?*bool,
         operation_timeout_ns: u64,
-        session: *c.LIBSSH2_SESSION,
+        session: *ssh2.LIBSSH2_SESSION,
         auth_options: *auth.Options,
     ) !void {
         while (true) {
@@ -1300,16 +1316,18 @@ pub const Transport = struct {
                 );
             }
 
-            const rc = c.libssh2_userauth_keyboard_interactive_ex(
+            const username = auth_options.username.?;
+
+            const rc = ssh2.libssh2_userauth_keyboard_interactive_ex(
                 session,
-                @ptrCast(@constCast(auth_options.username.?)),
-                @intCast(auth_options.username.?.len),
+                @ptrCast(@constCast(username)),
+                @intCast(username.len),
                 kbdInteractiveCallback,
             );
 
             if (rc == 0) {
                 break;
-            } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+            } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
                 try std.Io.Clock.Duration.sleep(
                     .{
                         .clock = .awake,
@@ -1321,14 +1339,13 @@ pub const Transport = struct {
                 continue;
             }
 
-            return errors.wrapCriticalError(
-                errors.ScrapliError.Transport,
-                @src(),
-                self.log,
+            self.log.info(
                 "ssh2.Transport handleKeyboardInteractiveAuth: failed keyboard " ++
                     "interactive authentication, error code {d}",
                 .{rc},
             );
+
+            return errors.ScrapliError.Transport;
         }
     }
 
@@ -1337,12 +1354,15 @@ pub const Transport = struct {
         start_time: std.Io.Timestamp,
         cancel: ?*bool,
         operation_timeout_ns: u64,
-        session: *c.LIBSSH2_SESSION,
+        session: *ssh2.LIBSSH2_SESSION,
         auth_options: *auth.Options,
     ) !void {
         // note: calling the converted c func instead of zig style due to typing issue similar
         // to -> https://github.com/ziglang/zig/issues/18824
-        const resolved_password = try auth_options.resolveAuthValue(auth_options.password.?);
+        const username = auth_options.username.?;
+        const password = auth_options.password.?;
+
+        const resolved_password = try auth_options.resolveAuthValue(password);
 
         while (true) {
             if (cancel != null and cancel.?.*) {
@@ -1365,10 +1385,10 @@ pub const Transport = struct {
                 );
             }
 
-            const rc = c.libssh2_userauth_password_ex(
+            const rc = ssh2.libssh2_userauth_password_ex(
                 session,
-                @ptrCast(@constCast(auth_options.username.?)),
-                @intCast(auth_options.username.?.len),
+                @ptrCast(@constCast(username)),
+                @intCast(username.len),
                 @ptrCast(@constCast(resolved_password)),
                 @intCast(resolved_password.len),
                 null,
@@ -1376,7 +1396,7 @@ pub const Transport = struct {
 
             if (rc == 0) {
                 break;
-            } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+            } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
                 try std.Io.Clock.Duration.sleep(
                     .{
                         .clock = .awake,
@@ -1388,14 +1408,13 @@ pub const Transport = struct {
                 continue;
             }
 
-            return errors.wrapWarnError(
-                errors.ScrapliError.Transport,
-                @src(),
-                self.log,
+            self.log.info(
                 "ssh2.Transport handlePasswordAuth: failed password authentication, " ++
-                    "will try keyboard interactive",
-                .{},
+                    "error code {d}, will try keyboard interactive. ",
+                .{rc},
             );
+
+            return errors.ScrapliError.Transport;
         }
     }
 
@@ -1404,8 +1423,8 @@ pub const Transport = struct {
         start_time: std.Io.Timestamp,
         cancel: ?*bool,
         operation_timeout_ns: u64,
-        session: *c.LIBSSH2_SESSION,
-    ) !?*c.LIBSSH2_CHANNEL {
+        session: *ssh2.LIBSSH2_SESSION,
+    ) !?*ssh2.LIBSSH2_CHANNEL {
         while (true) {
             if (cancel != null and cancel.?.*) {
                 return errors.wrapCriticalError(
@@ -1433,9 +1452,9 @@ pub const Transport = struct {
                 return channel;
             }
 
-            const rc = c.libssh2_session_last_errno(session);
+            const rc = ssh2.libssh2_session_last_errno(session);
 
-            if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+            if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
                 try std.Io.Clock.Duration.sleep(
                     .{
                         .clock = .awake,
@@ -1464,9 +1483,11 @@ pub const Transport = struct {
         operation_timeout_ns: u64,
         auth_options: *auth.Options,
     ) !void {
+        const proxy_jump_options = self.options.proxy_jump_options.?;
+
         const _host = try self.allocator.dupeSentinel(
             u8,
-            self.options.proxy_jump_options.?.host,
+            proxy_jump_options.host,
             0,
         );
         defer self.allocator.free(_host);
@@ -1495,16 +1516,16 @@ pub const Transport = struct {
             self.initial_channel = libssh2ChannelOpenProxySession(
                 self.initial_session,
                 _host,
-                self.options.proxy_jump_options.?.port,
+                proxy_jump_options.port,
             );
 
             if (self.initial_channel != null) {
                 break;
             }
 
-            const rc = c.libssh2_session_last_errno(self.initial_session.?);
+            const rc = ssh2.libssh2_session_last_errno(self.initial_session.?);
 
-            if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+            if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
                 try std.Io.Clock.Duration.sleep(
                     .{
                         .clock = .awake,
@@ -1526,7 +1547,7 @@ pub const Transport = struct {
             );
         }
 
-        self.proxy_session = c.libssh2_session_init_ex(
+        self.proxy_session = ssh2.libssh2_session_init_ex(
             null,
             null,
             null,
@@ -1542,16 +1563,16 @@ pub const Transport = struct {
             );
         }
 
-        if (self.options.proxy_jump_options.?.libssh2_trace) {
-            _ = c.libssh2_trace(
+        if (proxy_jump_options.libssh2_trace) {
+            _ = ssh2.libssh2_trace(
                 self.proxy_session.?,
-                c.LIBSSH2_TRACE_PUBLICKEY |
-                    c.LIBSSH2_TRACE_CONN |
-                    c.LIBSSH2_TRACE_ERROR |
-                    c.LIBSSH2_TRACE_SOCKET |
-                    c.LIBSSH2_TRACE_TRANS |
-                    c.LIBSSH2_TRACE_KEX |
-                    c.LIBSSH2_TRACE_AUTH,
+                ssh2.LIBSSH2_TRACE_PUBLICKEY |
+                    ssh2.LIBSSH2_TRACE_CONN |
+                    ssh2.LIBSSH2_TRACE_ERROR |
+                    ssh2.LIBSSH2_TRACE_SOCKET |
+                    ssh2.LIBSSH2_TRACE_TRANS |
+                    ssh2.LIBSSH2_TRACE_KEX |
+                    ssh2.LIBSSH2_TRACE_AUTH,
             );
         }
 
@@ -1574,10 +1595,13 @@ pub const Transport = struct {
         try file.setNonBlocking(local_fd);
         try file.setNonBlocking(remote_fd);
 
-        try self.proxy_wrapper.?.run(self.initial_channel.?, remote_fd);
-        errdefer self.proxy_wrapper.?.stop();
+        const proxy_wrapper = self.proxy_wrapper.?;
+        const initial_channel = self.initial_channel.?;
 
-        const handshake_rc = c.libssh2_session_handshake(self.proxy_session, local_fd);
+        try proxy_wrapper.run(initial_channel, remote_fd);
+        errdefer proxy_wrapper.stop();
+
+        const handshake_rc = ssh2.libssh2_session_handshake(self.proxy_session, local_fd);
         if (handshake_rc != 0) {
             return errors.wrapCriticalError(
                 errors.ScrapliError.Transport,
@@ -1588,15 +1612,15 @@ pub const Transport = struct {
             );
         }
 
-        c.libssh2_session_set_blocking(self.proxy_session, 0);
+        ssh2.libssh2_session_set_blocking(self.proxy_session, 0);
 
         const pa = try auth.Options.init(
             self.allocator,
             .{
-                .username = self.options.proxy_jump_options.?.username,
-                .password = self.options.proxy_jump_options.?.password,
-                .private_key_path = self.options.proxy_jump_options.?.private_key_path,
-                .private_key_passphrase = self.options.proxy_jump_options.?.private_key_passphrase,
+                .username = proxy_jump_options.username,
+                .password = proxy_jump_options.password,
+                .private_key_path = proxy_jump_options.private_key_path,
+                .private_key_passphrase = proxy_jump_options.private_key_passphrase,
                 .lookups = auth_options.lookups,
             },
         );
@@ -1624,7 +1648,7 @@ pub const Transport = struct {
         start_time: std.Io.Timestamp,
         cancel: ?*bool,
         operation_timeout_ns: u64,
-        channel: *c.LIBSSH2_CHANNEL,
+        channel: *ssh2.LIBSSH2_CHANNEL,
     ) !void {
         while (true) {
             if (cancel != null and cancel.?.*) {
@@ -1651,7 +1675,7 @@ pub const Transport = struct {
 
             if (rc == 0) {
                 break;
-            } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+            } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
                 try std.Io.Clock.Duration.sleep(
                     .{
                         .clock = .awake,
@@ -1678,7 +1702,7 @@ pub const Transport = struct {
         start_time: std.Io.Timestamp,
         cancel: ?*bool,
         operation_timeout_ns: u64,
-        channel: *c.LIBSSH2_CHANNEL,
+        channel: *ssh2.LIBSSH2_CHANNEL,
     ) !void {
         while (true) {
             if (cancel != null and cancel.?.*) {
@@ -1708,7 +1732,7 @@ pub const Transport = struct {
 
             if (rc == 0) {
                 break;
-            } else if (rc == c.LIBSSH2_ERROR_EAGAIN) {
+            } else if (rc == ssh2.LIBSSH2_ERROR_EAGAIN) {
                 try std.Io.Clock.Duration.sleep(
                     .{
                         .clock = .awake,
@@ -1758,86 +1782,107 @@ pub const Transport = struct {
         if (self.initial_session) |sess| {
             libssh2DisconnectSession(self.io, sess, self.log);
         }
+
+        if (self.stream) |stream| {
+            stream.close(self.io);
+            self.stream = null;
+            self.socket = null;
+        }
     }
 
     fn writeStandard(self: *Transport, buf: []const u8) !void {
         self.log.debug("ssh2.Transport writeStandard requested", .{});
 
-        try self.session_lock.lock(self.io);
-        defer self.session_lock.unlock(self.io);
+        while (true) {
+            try self.session_lock.lock(self.io);
+            const n = ssh2.libssh2_channel_write_ex(self.initial_channel.?, 0, buf.ptr, buf.len);
+            self.session_lock.unlock(self.io);
 
-        const n = c.libssh2_channel_write_ex(self.initial_channel.?, 0, buf.ptr, buf.len);
-        if (n == c.LIBSSH2_ERROR_EAGAIN) {
-            return self.writeStandard(buf);
-        }
+            if (n == ssh2.LIBSSH2_ERROR_EAGAIN) {
+                try std.Io.Clock.Duration.sleep(
+                    .{
+                        .clock = .awake,
+                        .raw = .fromNanoseconds(default_eagain_delay_ns),
+                    },
+                    self.io,
+                );
+                continue;
+            }
 
-        if (n < 0) {
-            return errors.wrapCriticalError(
-                errors.ScrapliError.Transport,
-                @src(),
-                self.log,
-                "ssh2.Transport writeStandard: write failed, return code: {d}",
-                .{n},
-            );
-        }
+            if (n < 0) {
+                return errors.wrapCriticalError(
+                    errors.ScrapliError.Transport,
+                    @src(),
+                    self.log,
+                    "ssh2.Transport writeStandard: write failed, return code: {d}",
+                    .{n},
+                );
+            }
 
-        if (n != buf.len) {
-            return errors.wrapCriticalError(
-                errors.ScrapliError.Transport,
-                @src(),
-                self.log,
-                "ssh2.Transport writeStandard: wrote {d} bytes, expected to write {d}",
-                .{ n, buf.len },
-            );
+            if (n != buf.len) {
+                return errors.wrapCriticalError(
+                    errors.ScrapliError.Transport,
+                    @src(),
+                    self.log,
+                    "ssh2.Transport writeStandard: wrote {d} bytes, expected to write {d}",
+                    .{ n, buf.len },
+                );
+            }
+
+            return;
         }
     }
 
     fn writeProxied(self: *Transport, buf: []const u8) !void {
         self.log.debug("ssh2.Transport writeProxied requested", .{});
 
-        try self.session_lock.lock(self.io);
-        defer self.session_lock.unlock(self.io);
+        while (true) {
+            try self.session_lock.lock(self.io);
+            const n = ssh2.libssh2_channel_write_ex(self.proxy_channel.?, 0, buf.ptr, buf.len);
+            self.session_lock.unlock(self.io);
 
-        const n = c.libssh2_channel_write_ex(self.proxy_channel.?, 0, buf.ptr, buf.len);
-        if (n == c.LIBSSH2_ERROR_EAGAIN) {
-            return self.writeProxied(buf);
-        }
+            if (n == ssh2.LIBSSH2_ERROR_EAGAIN) {
+                try std.Io.Clock.Duration.sleep(
+                    .{
+                        .clock = .awake,
+                        .raw = .fromNanoseconds(default_eagain_delay_ns),
+                    },
+                    self.io,
+                );
+                continue;
+            }
 
-        if (n < 0) {
-            return errors.wrapCriticalError(
-                errors.ScrapliError.Transport,
-                @src(),
-                self.log,
-                "ssh2.Transport writeProxied: write failed, return code: {d}",
-                .{n},
-            );
-        }
+            if (n < 0) {
+                return errors.wrapCriticalError(
+                    errors.ScrapliError.Transport,
+                    @src(),
+                    self.log,
+                    "ssh2.Transport writeProxied: write failed, return code: {d}",
+                    .{n},
+                );
+            }
 
-        if (n != buf.len) {
-            return errors.wrapCriticalError(
-                errors.ScrapliError.Transport,
-                @src(),
-                self.log,
-                "ssh2.Transport writeProxied: wrote {d} bytes, expected to write {d}",
-                .{ n, buf.len },
-            );
+            if (n != buf.len) {
+                return errors.wrapCriticalError(
+                    errors.ScrapliError.Transport,
+                    @src(),
+                    self.log,
+                    "ssh2.Transport writeProxied: wrote {d} bytes, expected to write {d}",
+                    .{ n, buf.len },
+                );
+            }
+
+            break;
         }
 
         if (self.proxy_wrapper) |pw| {
-            // have to copy from the libssh2 channel to the pipe connecting the outer and inner
-            // sessions basically
             while (true) {
-                const result = pw.pipeToChannel();
-                if (result) {
-                    break;
-                } else |err| {
-                    switch (err) {
-                        error.WouldBlock => {
-                            continue;
-                        },
-                        else => return err,
-                    }
-                }
+                pw.pipeToChannel() catch |err| switch (err) {
+                    error.WouldBlock => continue,
+                    else => return err,
+                };
+
+                break;
             }
         }
     }
@@ -1861,14 +1906,14 @@ pub const Transport = struct {
 
         // because nonblock we will just eagain forever (really until the timeout catches us)
         // if we dont check explicitly for eof, so do that
-        if (c.libssh2_channel_eof(self.initial_channel.?) == 1) {
+        if (ssh2.libssh2_channel_eof(self.initial_channel.?) == 1) {
             self.session_lock.unlock(self.io);
 
             return errors.ScrapliError.EOF;
         }
 
         // only locked around the actual read (and eof check), not waiting on kqueue/epoll stuff
-        const n = c.libssh2_channel_read_ex(
+        const n = ssh2.libssh2_channel_read_ex(
             self.initial_channel.?,
             @as(c_int, 0),
             &buf[0],
@@ -1877,7 +1922,7 @@ pub const Transport = struct {
 
         self.session_lock.unlock(self.io);
 
-        if (n == c.LIBSSH2_ERROR_EAGAIN) {
+        if (n == ssh2.LIBSSH2_ERROR_EAGAIN) {
             try self.waiter.wait(self.socket.?);
 
             return 0;
@@ -1899,12 +1944,12 @@ pub const Transport = struct {
 
         try self.session_lock.lock(self.io);
 
-        if (c.libssh2_channel_eof(self.proxy_channel.?) == 1) {
+        if (ssh2.libssh2_channel_eof(self.proxy_channel.?) == 1) {
             self.session_lock.unlock(self.io);
             return errors.ScrapliError.EOF;
         }
 
-        const n = c.libssh2_channel_read_ex(
+        const n = ssh2.libssh2_channel_read_ex(
             self.proxy_channel.?,
             @as(c_int, 0),
             &buf[0],
@@ -1922,7 +1967,7 @@ pub const Transport = struct {
             }
         };
 
-        if (n == c.LIBSSH2_ERROR_EAGAIN) {
+        if (n == ssh2.LIBSSH2_ERROR_EAGAIN) {
             self.proxy_wrapper.?.channelToPipe() catch |err| {
                 switch (err) {
                     error.WouldBlock => {
@@ -1960,8 +2005,9 @@ pub const Transport = struct {
         }
     }
 
-    /// Unblocks any in progress reads.
-    pub fn unblock(self: *Transport) !void {
+    /// Unblocks any in progress reads and sets the prepare close flag, this prevents us from
+    /// making a final read the fd that we are about to nuke.
+    pub fn prepareClose(self: *Transport) !void {
         try self.waiter.unblock();
     }
 };
@@ -1972,8 +2018,8 @@ fn kbdInteractiveCallback(
     instruction: [*c]const u8,
     instruction_len: c_int,
     num_prompts: c_int,
-    prompts: [*c]const c.LIBSSH2_USERAUTH_KBDINT_PROMPT,
-    responses: [*c]c.LIBSSH2_USERAUTH_KBDINT_RESPONSE,
+    prompts: [*c]const ssh2.LIBSSH2_USERAUTH_KBDINT_PROMPT,
+    responses: [*c]ssh2.LIBSSH2_USERAUTH_KBDINT_RESPONSE,
     abstract: [*c]?*anyopaque,
 ) callconv(.c) void {
     _ = name;

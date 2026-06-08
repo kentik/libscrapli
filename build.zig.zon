@@ -12,16 +12,16 @@
             .path = "lib/libssh2",
         },
         .xml = .{
-            .url = "https://github.com/carlmontanari/zig-xml/archive/3a521fa.tar.gz",
-            .hash = "xml-0.2.0-ZTbP3xY6AgDJfDkfwttfskdwZVn2B41zGlE7_g2pnQQf",
+            .url = "https://github.com/ianprime0509/zig-xml/archive/b97f2ab.tar.gz",
+            .hash = "xml-0.2.0-ZTbP3yI6AgB9Rpd2hQrueO63ib0Bm6mQiL_WB1t7JAmP",
         },
         .yaml = .{
             .url = "https://github.com/carlmontanari/zig-yaml/archive/cffc641.tar.gz",
             .hash = "zig_yaml-0.3.0-C1161vurAgCTAgiRzjMH2p7rjKKjJOMEBQ81bbclHk5v",
         },
         .zlinter = .{
-            .url = "https://github.com/kurtwagner/zlinter/archive/d358076.tar.gz",
-            .hash = "zlinter-0.0.1-OjQ08dLoCwBUQ4PmDPvrZNU8QXjHUrs7jp-JLwX5fmO0",
+            .url = "https://github.com/kurtwagner/zlinter/archive/c44f11b.tar.gz",
+            .hash = "zlinter-0.0.1-OjQ08avrCwDXLzWbn6PYtfEopUVPSxuNQDJ1dGvRhhCp",
         },
     },
     .paths = .{

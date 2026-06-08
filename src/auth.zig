@@ -300,22 +300,22 @@ pub fn processSearchableAuthBuf(
     return State._continue;
 }
 
-const open_error_message_substrings = [_][2][]const u8{
-    [2][]const u8{ "host key verification failed", "" },
-    [2][]const u8{ "no matching key exchange", "" },
-    [2][]const u8{ "no matching host key", "" },
-    [2][]const u8{ "no matching cipher", "" },
-    [2][]const u8{ "operation timed out", "" },
-    [2][]const u8{ "connection timed out", "" },
-    [2][]const u8{ "no route to host", "" },
-    [2][]const u8{ "bad configuration", "" },
-    [2][]const u8{ "could not resolve hostname", "" },
-    [2][]const u8{ "permission denied", "" },
-    [2][]const u8{ "unprotected private key file", "" },
-    [2][]const u8{ "too many authentication failures", "" },
-    [2][]const u8{ "connection refused", "" },
-    [2][]const u8{ "escape character is '^]'.", "are you telnet'ing to an ssh port?" },
-    [2][]const u8{ "ssh-2.0-openssh_", "are you telnet'ing to an ssh port?" },
+const open_error_message_substrings = [_][3][]const u8{
+    [3][]const u8{ "host key verification failed", "", "" },
+    [3][]const u8{ "no matching key exchange", "", "" },
+    [3][]const u8{ "no matching host key", "", "" },
+    [3][]const u8{ "no matching cipher", "", "" },
+    [3][]const u8{ "operation timed out", "", "" },
+    [3][]const u8{ "connection timed out", "", "" },
+    [3][]const u8{ "no route to host", "", "" },
+    [3][]const u8{ "bad configuration", "", "" },
+    [3][]const u8{ "could not resolve hostname", "", "" },
+    [3][]const u8{ "permission denied", "", "" },
+    [3][]const u8{ "unprotected private key file", "", "" },
+    [3][]const u8{ "too many authentication failures", "", "" },
+    [3][]const u8{ "connection refused", "", "" },
+    [3][]const u8{ "escape character is '^]'.", "are you telnet'ing to an ssh port?", "" },
+    [3][]const u8{ "ssh-2.0-openssh_", "are you telnet'ing to an ssh port?", "debug1:" },
 };
 
 /// Checks the buf to see if any known error messages show up in the contents.
@@ -329,6 +329,15 @@ pub fn openMessageHandler(allocator: std.mem.Allocator, buf: []const u8) !?[]con
 
     for (open_error_message_substrings) |error_substring| {
         if (std.mem.find(u8, copied_buf, error_substring[0]) != null) {
+            if (error_substring[2].len > 0 and std.mem.find(
+                u8,
+                copied_buf,
+                error_substring[2],
+            ) != null) {
+                // ignore substring in buf, continuing
+                continue;
+            }
+
             if (error_substring[1].len > 0) {
                 return error_substring[1];
             }
@@ -425,6 +434,11 @@ test "openMessageHandler" {
             .name = "sshing to telnet port",
             .haystack = "blah SSH-2.0-OpenSSH_ blah blah",
             .expected = "are you telnet'ing to an ssh port?",
+        },
+        .{
+            .name = "debug info about local ssh version",
+            .haystack = "debug1: Local version string SSH-2.0-OpenSSH_10.2",
+            .expected = null,
         },
     };
 
