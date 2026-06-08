@@ -76,6 +76,9 @@ jobs:
 
   functional:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
 
     # run e2e on main or prs pointing to main
     if: (github.ref_name == 'main' || github.base_ref == 'main') || (github.event_name == 'workflow_dispatch' && inputs.debug_functional)
@@ -92,9 +95,26 @@ jobs:
           echo "ZIG_VERSION=$ZIG_VERSION" >> "$GITHUB_ENV"
           echo "CONTAINERLAB_VERSION=$CONTAINERLAB_VERSION" >> "$GITHUB_ENV"
 
+      - name: login to ghcr
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
       - name: run scrapli-clab
         run: |
           make run-clab-ci
+
+      - name: verify clab launcher is running
+        run: |
+          set -euo pipefail
+          if ! docker ps --format '{{.Names}}' | grep -qx 'clab-launcher'; then
+            echo "clab-launcher is not running"
+            docker ps -a
+            docker logs clab-launcher || true
+            exit 1
+          fi
 
       - name: setup zig
         uses: mlugg/setup-zig@v2
@@ -115,3 +135,10 @@ jobs:
       - name: run the functional tests
         run: |
           make test-functional-ci
+
+      - name: dump docker state on failure
+        if: failure()
+        run: |
+          docker ps -a
+          docker logs clab-launcher || true
+          docker network inspect clab || true
