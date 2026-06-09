@@ -117,6 +117,7 @@ pub fn build(b: *std.Build) !void {
         .{
             .flags = &.{
                 "-fPIC",
+                "-fno-sanitize=all",
             },
             .files = &.{
                 "pcre2/src/pcre2_auto_possess.c",
