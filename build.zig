@@ -575,6 +575,42 @@ fn buildFFI(
     }
 }
 
+/// FFI shared libraries are distributed artifacts that get dlopen'd (via
+/// purego/ctypes) on arbitrary deployment CPUs, so an x86_64 build that did not
+/// explicitly pin a CPU is forced to the portable architecture baseline.
+///
+/// A bare `zig build ffi` (no -Dtarget/-Dcpu) resolves to the *native* CPU
+/// (`Target.Query.CpuModel.determined_by_arch_os` with a null `cpu_arch` means
+/// native), so on an AVX-512-capable build host Zig emits EVEX instructions such
+/// as `vpcmpneqb` that SIGILL ("illegal instruction") on deployment CPUs lacking
+/// AVX-512. Cross builds (`-Dtarget=...`) set a non-null `cpu_arch` and already
+/// resolve to baseline; an explicit `-Dcpu=...` (native/baseline/specific model)
+/// is always respected. See NMS-1049.
+fn baselineFfiTarget(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+) std.Build.ResolvedTarget {
+    if (target.result.cpu.arch != .x86_64) {
+        return target;
+    }
+
+    const q = target.query;
+
+    const uses_default_native_cpu = q.cpu_arch == null and
+        q.cpu_model == .determined_by_arch_os and
+        q.cpu_features_add.isEmpty() and
+        q.cpu_features_sub.isEmpty();
+
+    if (!uses_default_native_cpu) {
+        return target;
+    }
+
+    var baseline_query = q;
+    baseline_query.cpu_model = .baseline;
+
+    return b.resolveTargetQuery(baseline_query);
+}
+
 fn buildFFITarget(
     b: *std.Build,
     ffi: *std.Build.Step,
@@ -582,12 +618,14 @@ fn buildFFITarget(
     optimize: std.builtin.OptimizeMode,
     dependency_linkage: std.builtin.LinkMode,
 ) !void {
+    const resolved_target = baselineFfiTarget(b, target);
+
     const libscrapli = b.addLibrary(
         .{
             .name = "scrapli",
             .root_module = try buildScrapli(
                 b,
-                target,
+                resolved_target,
                 optimize,
                 dependency_linkage,
                 true,
