@@ -101,6 +101,7 @@ pub fn build(b: *std.Build) void {
             },
             .flags = &.{
                 "-fPIC",
+                "-fno-sanitize=all",
                 "-DWITH_OPENSSL=ON",
                 "-DBUILD_STATIC_LIBS=ON",
                 "-DBUILD_SHARED_LIBS=OFF",

@@ -112,11 +112,21 @@ pub fn build(b: *std.Build) !void {
             b.path("pcre2/src/pcre2_chartables.c.dist"),
             "pcre2_chartables.c",
         ),
+        // Compile this generated translation unit with the same flags as the bulk
+        // pcre2 sources below so the whole dependency is built uniformly. Without
+        // these, pcre2_chartables.c keeps the default sanitizer/SSP instrumentation
+        // (which can emit ud2 traps over the ffi boundary) and is built without
+        // -fPIC despite being linked into the shared library.
+        .flags = &.{
+            "-fPIC",
+            "-fno-sanitize=all",
+        },
     });
     lib_mod.addCSourceFiles(
         .{
             .flags = &.{
                 "-fPIC",
+                "-fno-sanitize=all",
             },
             .files = &.{
                 "pcre2/src/pcre2_auto_possess.c",
