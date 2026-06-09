@@ -808,6 +808,11 @@ pub const FfiDriver = struct {
             unreachable;
         }
 
+        if (!ret.?.done) {
+            // Not an exceptional condition; callers convert this to FfiResult.operation.
+            return errors.ScrapliError.Operation;
+        }
+
         if (remove) {
             // clean it up
             _ = self.operation_results.remove(operation_id);
