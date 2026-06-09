@@ -809,13 +809,8 @@ pub const FfiDriver = struct {
         }
 
         if (!ret.?.done) {
-            return errors.wrapCriticalError(
-                errors.ScrapliError.Operation,
-                @src(),
-                self.getLogger(),
-                "operation not complete",
-                .{},
-            );
+            // Not an exceptional condition; callers convert this to FfiResult.operation.
+            return errors.ScrapliError.Operation;
         }
 
         if (remove) {
