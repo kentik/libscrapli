@@ -279,7 +279,15 @@ export fn ls_netconf_fetch_operation(
     if (ret.err != null) {
         const err_name = @errorName(ret.err.?);
 
-        @memcpy(operation_error.*.ptr, err_name);
+        // Copy as much of the error name as fits in the caller-provided buffer (sized via
+        // ls_netconf_fetch_operation_sizes). We deliberately bound the length with @min and use
+        // copyForwards rather than @memcpy: this is an ffi boundary, and an informational error
+        // name must never be able to abort the entire host process. A plain @memcpy here asserts
+        // both equal lengths *and* non-aliasing in safe builds; if the size and fetch calls ever
+        // disagree (or the source/destination unexpectedly relate), that assertion turns a benign
+        // mismatch into a SIGABRT for the whole agent.
+        const n = @min(operation_error.len, err_name.len);
+        std.mem.copyForwards(u8, operation_error.*[0..n], err_name[0..n]);
     } else {
         const dret = switch (ret.result) {
             .netconf => |r| r.?,
