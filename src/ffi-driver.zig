@@ -862,6 +862,13 @@ pub const FfiDriver = struct {
         if (r.splits_ns.items.len > 0) {
             operation_start_time.* = @intCast(r.start_time_ns);
             for (0.., r.splits_ns.items) |idx, split| {
+                // operation_splits is sized by the caller to operation_count (== results len);
+                // splits_ns is a distinct array, so guard against any length disagreement rather
+                // than risk an out-of-bounds write that would abort the host process.
+                if (idx >= operation_splits.len) {
+                    break;
+                }
+
                 operation_splits.*[idx] = @intCast(split);
             }
         } else {
@@ -876,12 +883,16 @@ pub const FfiDriver = struct {
         var cur: usize = 0;
 
         for (0.., r.inputs.items) |idx, input| {
-            @memcpy(operation_input.*[cur .. cur + input.len], input);
+            // bounded + alias-tolerant copy: these destinations are caller (Go/Python) owned ffi
+            // buffers sized by a separate sizes call, so never let a mismatch abort via @memcpy.
+            bytes.ffiCopyAt(operation_input.*, cur, input);
             cur += input.len;
 
             if (idx != r.inputs.items.len - 1) {
                 for (bytes.libscrapli_delimiter) |delimiter_char| {
-                    operation_input.*[cur] = delimiter_char;
+                    if (cur < operation_input.len) {
+                        operation_input.*[cur] = delimiter_char;
+                    }
                     cur += 1;
                 }
             }
@@ -891,7 +902,7 @@ pub const FfiDriver = struct {
         try r.getResultPreAllocated(operation_result.*, get_options);
 
         if (r.result_failure_indicated) {
-            @memcpy(
+            _ = bytes.ffiCopy(
                 operation_result_failed_indicator.*,
                 r.failed_indicators.?.items[@intCast(r.result_failure_indicator)],
             );
