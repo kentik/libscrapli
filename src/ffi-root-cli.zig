@@ -2,6 +2,7 @@
 const std = @import("std");
 
 const cli = @import("cli.zig");
+const bytes = @import("bytes.zig");
 const errors = @import("errors.zig");
 const ffi_args_to_options = @import("ffi-args-to-cli-options.zig");
 const ffi_common = @import("ffi-common.zig");
@@ -26,9 +27,9 @@ export fn ls_cli_get_ntc_templates_platform(
                 return @intFromEnum(ffi_common.FfiResult.success);
             }
 
-            for (0.., rd.definition.ntc_templates_platform.?) |idx, char| {
-                ntc_template_platform.*[idx] = char;
-            }
+            // bounded copy: the caller pre-sizes this buffer with a guessed length, so a longer
+            // platform string must truncate rather than overflow and abort the host process.
+            _ = bytes.ffiCopy(ntc_template_platform.*, rd.definition.ntc_templates_platform.?);
 
             return @intFromEnum(ffi_common.FfiResult.success);
         },
@@ -53,9 +54,9 @@ export fn ls_cli_get_genie_platform(
                 return @intFromEnum(ffi_common.FfiResult.success);
             }
 
-            for (0.., rd.definition.genie_platform.?) |idx, char| {
-                genie_platform.*[idx] = char;
-            }
+            // bounded copy: the caller pre-sizes this buffer with a guessed length, so a longer
+            // platform string must truncate rather than overflow and abort the host process.
+            _ = bytes.ffiCopy(genie_platform.*, rd.definition.genie_platform.?);
 
             return @intFromEnum(ffi_common.FfiResult.success);
         },
