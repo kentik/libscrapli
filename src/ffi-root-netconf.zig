@@ -2,6 +2,7 @@
 const std = @import("std");
 
 const ascii = @import("ascii.zig");
+const bytes = @import("bytes.zig");
 const errors = @import("errors.zig");
 const ffi_args_to_options = @import("ffi-args-to-netconf-options.zig");
 const ffi_common = @import("ffi-common.zig");
@@ -316,9 +317,11 @@ export fn ls_netconf_fetch_operation(
             operation_end_time.* = @intCast(dret.end_time_ns);
         }
 
-        @memcpy(operation_input.*, dret.input);
-        @memcpy(operation_result_raw.*, dret.result_raw);
-        @memcpy(operation_result.*, dret.result);
+        // bounded + alias-tolerant copies: these destinations are caller (Go/Python) owned ffi
+        // buffers sized by a separate sizes call, so never let a mismatch abort via @memcpy.
+        _ = bytes.ffiCopy(operation_input.*, dret.input);
+        _ = bytes.ffiCopy(operation_result_raw.*, dret.result_raw);
+        _ = bytes.ffiCopy(operation_result.*, dret.result);
 
         // to avoid a pointless allocation since we are already copying from the result into the
         // given string pointers, we'll do basically the same thing the result does in normal (zig)
@@ -326,11 +329,13 @@ export fn ls_netconf_fetch_operation(
         // copying from there, inserting newlines between results, into the given pointer(s)
         var cur: usize = 0;
         for (0.., dret.result_warning_messages.items) |idx, warning| {
-            @memcpy(operation_rpc_warnings.*[cur .. cur + warning.len], warning);
+            bytes.ffiCopyAt(operation_rpc_warnings.*, cur, warning);
             cur += warning.len;
 
             if (idx != dret.result_warning_messages.items.len - 1) {
-                operation_rpc_warnings.*[cur] = ascii.control_chars.lf;
+                if (cur < operation_rpc_warnings.len) {
+                    operation_rpc_warnings.*[cur] = ascii.control_chars.lf;
+                }
                 cur += 1;
             }
         }
@@ -338,11 +343,13 @@ export fn ls_netconf_fetch_operation(
         cur = 0;
 
         for (0.., dret.result_error_messages.items) |idx, err| {
-            @memcpy(operation_rpc_errors.*[cur .. cur + err.len], err);
+            bytes.ffiCopyAt(operation_rpc_errors.*, cur, err);
             cur += err.len;
 
             if (idx != dret.result_error_messages.items.len - 1) {
-                operation_rpc_errors.*[cur] = ascii.control_chars.lf;
+                if (cur < operation_rpc_errors.len) {
+                    operation_rpc_errors.*[cur] = ascii.control_chars.lf;
+                }
                 cur += 1;
             }
         }
@@ -403,7 +410,7 @@ export fn ls_netconf_next_notification_message(
 
     const notif = d.real_driver.netconf.notifications.orderedRemove(0);
 
-    @memcpy(notification.*, notif);
+    _ = bytes.ffiCopy(notification.*, notif);
 
     d.real_driver.netconf.allocator.free(notif);
 
@@ -455,7 +462,7 @@ export fn ls_netconf_next_subscription_message(
 
     const sub = subs.?.orderedRemove(0);
 
-    @memcpy(subscription.*, sub);
+    _ = bytes.ffiCopy(subscription.*, sub);
 
     d.real_driver.netconf.allocator.free(sub);
 

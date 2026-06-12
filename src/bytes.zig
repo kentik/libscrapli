@@ -6,6 +6,39 @@ const ascii = @import("ascii.zig");
 /// via ffi to not have to deal w/ c arrays and such
 pub const libscrapli_delimiter = "__libscrapli__";
 
+/// ffiCopy copies as many bytes as will fit from src into dest (starting at dest[0]) and returns
+/// the number of bytes copied. Unlike the @memcpy builtin, it tolerates length mismatches and
+/// aliasing/overlap *without aborting the process*.
+///
+/// This is mandatory at the ffi boundary: dest is a buffer owned by the calling runtime (Go /
+/// Python) and is sized by a *separate* "sizes" ffi call before the data is fetched. If the size
+/// pass and the fetch pass ever observe inconsistent result state -- e.g. due to a
+/// time-of-check/time-of-use race on a driver shared across threads -- a raw @memcpy would trip its
+/// safety assertions ("@memcpy arguments alias" / "@memcpy arguments have non-equal lengths") and
+/// SIGABRT the *entire host process*. Best-effort truncation is always preferable to crashing the
+/// host here; the worst case is a truncated/garbled value surfaced as a normal result, not a crash.
+pub fn ffiCopy(dest: []u8, src: []const u8) usize {
+    const n = @min(dest.len, src.len);
+    if (n == 0) {
+        return 0;
+    }
+
+    std.mem.copyForwards(u8, dest[0..n], src[0..n]);
+
+    return n;
+}
+
+/// ffiCopyAt is ffiCopy but writes into dest starting at the given offset, clamping to the end of
+/// dest (and is a no-op when offset >= dest.len). Used by the delimited writers that copy several
+/// segments into a single ffi buffer using a running cursor.
+pub fn ffiCopyAt(dest: []u8, offset: usize, src: []const u8) void {
+    if (offset >= dest.len) {
+        return;
+    }
+
+    _ = ffiCopy(dest[offset..], src);
+}
+
 /// Convert all contents of buf to lower.
 pub fn toLower(buf: []u8) void {
     for (buf) |*b| {

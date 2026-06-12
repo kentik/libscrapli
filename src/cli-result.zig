@@ -1,5 +1,6 @@
 const std = @import("std");
 
+const bytes = @import("bytes.zig");
 const operation = @import("cli-operation.zig");
 
 /// Holds options related to how a result should look.
@@ -308,27 +309,30 @@ pub const Result = struct {
             for (render_result) |ch| {
                 if (options.normalize_line_feeds and ch == '\r') continue;
 
+                // every write into `out` is bounds-guarded: `out` may be a caller-owned (Go /
+                // Python) ffi buffer whose size came from a separate sizes call, so a disagreement
+                // must truncate rather than abort the host process with an out-of-bounds panic.
                 if (options.normalize_trailing_whitespace) {
                     if (ch == '\n') {
                         pending_ws = 0;
 
-                        out[cur] = ch;
+                        if (cur < out.len) out[cur] = ch;
                         cur += 1;
                     } else if (ch == ' ' or ch == '\t') {
                         pending_ws += 1;
                     } else {
                         var i: usize = 0;
                         while (i < pending_ws) : (i += 1) {
-                            out[cur] = ' ';
+                            if (cur < out.len) out[cur] = ' ';
                             cur += 1;
                         }
                         pending_ws = 0;
 
-                        out[cur] = ch;
+                        if (cur < out.len) out[cur] = ch;
                         cur += 1;
                     }
                 } else {
-                    out[cur] = ch;
+                    if (cur < out.len) out[cur] = ch;
                     cur += 1;
                 }
             }
@@ -339,7 +343,7 @@ pub const Result = struct {
                 }
 
                 for (options.delimiter) |delimiter_char| {
-                    out[cur] = delimiter_char;
+                    if (cur < out.len) out[cur] = delimiter_char;
                     cur += 1;
                 }
             }
@@ -356,12 +360,14 @@ pub const Result = struct {
         var cur: usize = 0;
 
         for (0.., self.results_raw.items) |idx, result_raw| {
-            @memcpy(out[cur .. cur + result_raw.len], result_raw);
+            // bounded + alias-tolerant: out may be a caller-owned ffi buffer sized by a separate
+            // sizes call, so a mismatch must truncate rather than abort the host via @memcpy.
+            bytes.ffiCopyAt(out, cur, result_raw);
             cur += result_raw.len;
 
             if (idx != self.results_raw.items.len - 1) {
                 for (options.delimiter) |delimiter_char| {
-                    out[cur] = delimiter_char;
+                    if (cur < out.len) out[cur] = delimiter_char;
                     cur += 1;
                 }
             }
