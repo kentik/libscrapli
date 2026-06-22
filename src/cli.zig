@@ -476,6 +476,10 @@ pub const Driver = struct {
                                     .requested_mode = self.current_mode,
                                     .retain_input = true,
                                     .retain_trailing_prompt = true,
+                                    // this transition lands us in next_mode_name, so the device
+                                    // responds with that mode's prompt -- terminate the read on it
+                                    // rather than the mode we are leaving.
+                                    ._mode_prompt_pattern = self.modePromptPattern(next_mode_name),
                                 },
                             ),
                         );
@@ -509,6 +513,9 @@ pub const Driver = struct {
                                         .requested_mode = self.current_mode,
                                         .retain_input = true,
                                         .retain_trailing_prompt = true,
+                                        // this transition lands us in next_mode_name, so terminate
+                                        // the read on that destination mode's prompt.
+                                        ._mode_prompt_pattern = self.modePromptPattern(next_mode_name),
                                     },
                                 ),
                             );
@@ -536,6 +543,15 @@ pub const Driver = struct {
         self.current_mode = self.definition.modes.getKey(options.requested_mode).?;
 
         return res;
+    }
+
+    /// Resolve the compiled prompt pattern for the named mode. Used to terminate input reads on
+    /// the *active mode's* (strict) prompt pattern rather than the broad global pattern. Returns
+    /// null when the mode is unknown or has no compiled pattern, in which case callers fall back
+    /// to the session's global prompt pattern.
+    fn modePromptPattern(self: *Driver, mode_name: []const u8) ?*re.pcre2CompiledPattern {
+        const m = self.definition.modes.get(mode_name) orelse return null;
+        return m.compiled_prompt_pattern;
     }
 
     /// Send the given input to the device.
@@ -573,10 +589,21 @@ pub const Driver = struct {
             ret.deinit();
         }
 
+        // The session is now in target_mode, so terminate the trailing prompt read on that mode's
+        // strict prompt pattern rather than the broad global one. Only resolve it from target_mode
+        // when the caller has not already supplied one: enterMode's transition sends explicitly
+        // pass the *destination* mode's pattern, which must not be clobbered here (during those
+        // transitions self.current_mode is still the mode being left, so target_mode would resolve
+        // to the wrong, soon-to-be-stale pattern).
+        var session_options = options;
+        if (session_options._mode_prompt_pattern == null) {
+            session_options._mode_prompt_pattern = self.modePromptPattern(target_mode);
+        }
+
         try res.record(
             .{
                 .input = options.input,
-                .rets = try self.session.sendInput(allocator, options),
+                .rets = try self.session.sendInput(allocator, session_options),
             },
         );
 
@@ -641,6 +668,7 @@ pub const Driver = struct {
                                 .input_handling = options.input_handling,
                                 .retain_input = options.retain_input,
                                 .retain_trailing_prompt = options.retain_trailing_prompt,
+                                ._mode_prompt_pattern = self.modePromptPattern(target_mode),
                             },
                         ),
                     },
@@ -664,6 +692,7 @@ pub const Driver = struct {
                                 .input_handling = options.input_handling,
                                 .retain_input = options.retain_input,
                                 .retain_trailing_prompt = options.retain_trailing_prompt,
+                                ._mode_prompt_pattern = self.modePromptPattern(target_mode),
                             },
                         ),
                     },
