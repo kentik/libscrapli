@@ -476,6 +476,10 @@ pub const Driver = struct {
                                     .requested_mode = self.current_mode,
                                     .retain_input = true,
                                     .retain_trailing_prompt = true,
+                                    // this transition lands us in next_mode_name, so the device
+                                    // responds with that mode's prompt -- terminate the read on it
+                                    // rather than the mode we are leaving.
+                                    ._mode_prompt_pattern = self.modePromptPattern(next_mode_name),
                                 },
                             ),
                         );
@@ -509,6 +513,9 @@ pub const Driver = struct {
                                         .requested_mode = self.current_mode,
                                         .retain_input = true,
                                         .retain_trailing_prompt = true,
+                                        // this transition lands us in next_mode_name, so terminate
+                                        // the read on that destination mode's prompt.
+                                        ._mode_prompt_pattern = self.modePromptPattern(next_mode_name),
                                     },
                                 ),
                             );
@@ -583,9 +590,15 @@ pub const Driver = struct {
         }
 
         // The session is now in target_mode, so terminate the trailing prompt read on that mode's
-        // strict prompt pattern rather than the broad global one.
+        // strict prompt pattern rather than the broad global one. Only resolve it from target_mode
+        // when the caller has not already supplied one: enterMode's transition sends explicitly
+        // pass the *destination* mode's pattern, which must not be clobbered here (during those
+        // transitions self.current_mode is still the mode being left, so target_mode would resolve
+        // to the wrong, soon-to-be-stale pattern).
         var session_options = options;
-        session_options._mode_prompt_pattern = self.modePromptPattern(target_mode);
+        if (session_options._mode_prompt_pattern == null) {
+            session_options._mode_prompt_pattern = self.modePromptPattern(target_mode);
+        }
 
         try res.record(
             .{
