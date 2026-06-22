@@ -1163,8 +1163,14 @@ pub const Session = struct {
             try bufs.processed.resize(self.allocator, 0);
         }
 
+        // Terminate the trailing prompt read on the *active mode's* prompt pattern when the driver
+        // supplied one. The global prompt pattern is intentionally broad (it must match any mode's
+        // prompt during mode discovery), which means device output lines that incidentally end in
+        // a prompt-terminator char can prematurely satisfy it and truncate the read. The per-mode
+        // pattern is strict, so we prefer it here and only fall back to the global pattern when no
+        // mode-specific pattern is available.
         const check_args = bytes_check.CheckArgs{
-            .pattern = self.compiled_prompt_pattern,
+            .pattern = options._mode_prompt_pattern orelse self.compiled_prompt_pattern,
             .actual = options.input,
         };
 

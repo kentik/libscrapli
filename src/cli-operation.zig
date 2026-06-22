@@ -1,5 +1,6 @@
 const cli = @import("cli.zig");
 const mode = @import("cli-mode.zig");
+const re = @import("re.zig");
 
 /// Is the max amount of read callbacks we support, static so we can do things without allocations.
 pub const max_ffi_read_with_callbacks_callbacks = 32;
@@ -71,6 +72,13 @@ pub const SendInputOptions = struct {
     // stop on any indicated failure (default) or continue just shipping inputs. only relevant
     // when executing a plural send inputS operation of course.
     stop_on_indicated_failure: bool = true,
+    // internal-only: the compiled prompt pattern of the mode this input is sent at. the driver
+    // sets this after it has ensured the session is in the target mode so the trailing prompt
+    // read terminates on the *active mode's* (strict) pattern rather than the broad global
+    // pattern -- this prevents device output lines that incidentally satisfy the loose global
+    // pattern (e.g. Junos `## Warning:` delimiter lines) from ending the read mid-output. null
+    // (the default, and what ffi callers always leave it as) falls back to the global pattern.
+    _mode_prompt_pattern: ?*re.pcre2CompiledPattern = null,
 };
 
 /// Holds options for the SendInputs (plural) operation.
