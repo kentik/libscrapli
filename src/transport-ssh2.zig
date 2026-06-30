@@ -1175,12 +1175,14 @@ pub const Transport = struct {
                 0,
             );
 
-            self.log.debug(
-                "ssh2.Transport handlePrivateKeyAuth: libssh2 error code {d}: {?s}",
-                .{ err, if (errmsg != null and errlen > 0) errmsg[0..@intCast(errlen)] else null },
-            );
+            if (errmsg != null and errlen > 0) {
+                const msg_slice = errmsg[0..@intCast(errlen)];
+                self.log.debug("libssh2 error: {} {s}\n", .{ err, msg_slice });
+            } else {
+                self.log.debug("libssh2 error: {} (no message)\n", .{err});
+            }
 
-            return errors.wrapWarnError(
+            return errors.wrapCriticalError(
                 errors.ScrapliError.Transport,
                 @src(),
                 self.log,
