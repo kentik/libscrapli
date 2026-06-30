@@ -809,7 +809,6 @@ pub const FfiDriver = struct {
         }
 
         if (!ret.?.done) {
-            // Not an exceptional condition; callers convert this to FfiResult.operation.
             return errors.ScrapliError.Operation;
         }
 
