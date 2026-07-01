@@ -1252,8 +1252,8 @@ pub fn stripAsciiAndAnsiControlCharsInFile(
     io: std.Io,
     f: []const u8,
 ) !void {
-    const cwd = std.Io.Dir.cwd();
-    var in = try cwd.openFile(
+    const io_cwd = std.Io.Dir.cwd();
+    var in = try io_cwd.openFile(
         io,
         f,
         .{
@@ -1265,19 +1265,10 @@ pub fn stripAsciiAndAnsiControlCharsInFile(
     var r_buffer: [8192]u8 = undefined;
     var reader = in.reader(io, &r_buffer);
 
-    var tmp_path_buf: [4096]u8 = undefined;
-    const tmp_path = try std.fmt.bufPrint(
-        &tmp_path_buf,
-        "{s}.{x}.tmp",
-        .{
-            f,
-            @intFromPtr(&tmp_path_buf),
-        },
-    );
-
+    const cwd = std.Io.Dir.cwd();
     var tmp_file = try cwd.createFile(
         io,
-        tmp_path,
+        "tmp_output",
         .{
             .read = true,
             .truncate = true,
@@ -1302,5 +1293,5 @@ pub fn stripAsciiAndAnsiControlCharsInFile(
 
     try writer.interface.flush();
 
-    try cwd.rename(tmp_path, cwd, f, io);
+    try cwd.rename("tmp_output", cwd, f, io);
 }

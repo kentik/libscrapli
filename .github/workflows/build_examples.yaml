@@ -25,6 +25,11 @@ jobs:
         with:
           version: ${{ env.ZIG_VERSION }}
 
+      - name: ensure openssl generate step cached
+        run: |
+          zig build
+        working-directory: lib/openssl
+
       - name: build the examples
         run: |
           make build-examples
