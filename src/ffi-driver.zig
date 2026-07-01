@@ -171,6 +171,15 @@ pub const FfiDriver = struct {
         self.operation_condition.signal(self.io);
         self.operation_lock.unlock(self.io);
 
+        // operation_stop is only observed *between* operations, but the operation thread may
+        // currently be blocked *inside* an operation on a cooperative read (e.g. when the operation
+        // timeout is disabled and cancellation never arrives). Signal the underlying session to
+        // abort any in-flight read now so the operation returns and ot.join() below cannot block
+        // forever.
+        switch (self.real_driver) {
+            inline else => |d| d.session.signalCloseRequested(),
+        }
+
         if (self.operation_thread) |ot| {
             ot.join();
         }

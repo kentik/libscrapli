@@ -293,6 +293,17 @@ pub const Driver = struct {
         );
         errdefer res.deinit();
 
+        // always tear down the underlying session (and its background read thread), even if the
+        // on-close callback below returns an error. previously an errored on-close would return
+        // early and skip session teardown, orphaning the read thread. session.close is idempotent.
+        // zlint-disable-next-line suppressed-errors
+        defer self.session.close() catch |err| {
+            self.log.warn(
+                "cli.Driver close: session close returned an error '{}', ignoring",
+                .{err},
+            );
+        };
+
         if (self.definition.onCloseCallback != null or
             self.definition.bound_on_close_callback != null)
         {
@@ -316,8 +327,6 @@ pub const Driver = struct {
                 );
             }
         }
-
-        try self.session.close();
 
         return res;
     }
