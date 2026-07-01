@@ -293,11 +293,15 @@ pub const Driver = struct {
         );
         errdefer res.deinit();
 
-        // always tear down the underlying session (and its background read thread), even if the
-        // on-close callback below returns an error. previously an errored on-close would return
-        // early and skip session teardown, orphaning the read thread. session.close is idempotent.
+        // if the on-close callback below returns an error, still tear down the underlying session
+        // (and its background read thread) so the read thread isn't orphaned; previously an errored
+        // on-close returned early and skipped session teardown. on the success path we close the
+        // session explicitly below and propagate any close error to the caller (matching
+        // netconf.Driver and the prior `try self.session.close()` behavior). session.close is
+        // idempotent, so if the explicit close below errors, this errdefer's re-invocation is a
+        // harmless no-op.
         // zlint-disable-next-line suppressed-errors
-        defer self.session.close() catch |err| {
+        errdefer self.session.close() catch |err| {
             self.log.warn(
                 "cli.Driver close: session close returned an error '{}', ignoring",
                 .{err},
@@ -327,6 +331,9 @@ pub const Driver = struct {
                 );
             }
         }
+
+        // success path: close explicitly and propagate any close error to the caller.
+        try self.session.close();
 
         return res;
     }
