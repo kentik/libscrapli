@@ -194,6 +194,10 @@ pub const Session = struct {
 
     read_thread: ?std.Thread,
     read_stop: std.atomic.Value(ReadThreadState),
+    // signals in-flight cooperative reads (see readTimeout) that the session is being torn down so
+    // they stop looping and return promptly, even when the operation timeout is disabled (0) and
+    // the caller relies solely on cooperative cancellation that may never arrive.
+    close_requested: std.atomic.Value(bool),
     read_lock: std.Io.Mutex,
     read_queue: queue.LinearFifo(
         u8,
@@ -247,6 +251,7 @@ pub const Session = struct {
             .transport = t,
             .read_thread = null,
             .read_stop = std.atomic.Value(ReadThreadState).init(ReadThreadState.uninitialized),
+            .close_requested = std.atomic.Value(bool).init(false),
             .read_lock = std.Io.Mutex.init,
             .read_queue = queue.LinearFifo(
                 u8,
@@ -368,6 +373,10 @@ pub const Session = struct {
     ) ![2][]const u8 {
         self.log.info("session.Session open requested", .{});
 
+        // clear any stale close-requested signal from a previous session lifecycle so a freshly
+        // opened session starts clean.
+        self.close_requested.store(false, std.builtin.AtomicOrder.release);
+
         const start_time = std.Io.Timestamp.now(self.io, .awake);
 
         try self.transport.open(
@@ -414,10 +423,22 @@ pub const Session = struct {
         );
     }
 
+    /// Signals any in-flight cooperative read (see readTimeout) that the session is being torn
+    /// down so it stops looping and returns promptly. This is required so a stuck read cannot
+    /// block teardown/join indefinitely when the operation timeout is disabled (0) and the caller
+    /// relies solely on cooperative cancellation that may never arrive.
+    pub fn signalCloseRequested(self: *Session) void {
+        self.close_requested.store(true, std.builtin.AtomicOrder.release);
+    }
+
     /// Closes the session, stopping the read thread, unblocking any in flight reads of the
     /// transport, flushing the recorder, and finally closing the transport object itself.
     pub fn close(self: *Session) !void {
         self.log.info("session.Session close requested", .{});
+
+        // make sure any in-flight cooperative read bails out promptly rather than looping until
+        // an operation timeout (which may be disabled) or cancellation (which may never arrive).
+        self.signalCloseRequested();
 
         if (self.read_stop.load(std.builtin.AtomicOrder.acquire) != ReadThreadState.run) {
             return;
@@ -853,6 +874,16 @@ pub const Session = struct {
                     @src(),
                     self.log,
                     "session.Session readTimeout: operation cancelled",
+                    .{},
+                );
+            }
+
+            if (self.close_requested.load(std.builtin.AtomicOrder.acquire)) {
+                return errors.wrapCriticalError(
+                    errors.ScrapliError.Cancelled,
+                    @src(),
+                    self.log,
+                    "session.Session readTimeout: session close requested, aborting read",
                     .{},
                 );
             }
