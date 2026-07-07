@@ -171,6 +171,25 @@ pub const FfiDriver = struct {
         self.operation_condition.signal(self.io);
         self.operation_lock.unlock(self.io);
 
+        // operation_stop is only observed *between* operations, but the operation thread may
+        // currently be blocked *inside* an operation on a cooperative read (e.g. when the operation
+        // timeout is disabled and cancellation never arrives). Close the underlying session now so
+        // any in-flight read is aborted (letting the operation return so ot.join() below cannot
+        // block forever) and, critically, so the session's background read thread is stopped/joined
+        // and the transport closed here rather than relying solely on the later session.deinit() to
+        // do it -- avoiding any window where the read thread outlives session teardown.
+        // session.close is idempotent, so the subsequent d.deinit()/session.deinit() re-invocation
+        // is a harmless no-op. Best-effort: teardown must not fail deinit.
+        // zlint-disable-next-line suppressed-errors
+        switch (self.real_driver) {
+            inline else => |d| d.session.close() catch |err| {
+                d.log.warn(
+                    "FfiDriver deinit: session close returned an error '{}', ignoring",
+                    .{err},
+                );
+            },
+        }
+
         if (self.operation_thread) |ot| {
             ot.join();
         }
