@@ -27,6 +27,39 @@ fn libssh2InitializeOnce() c_int {
     return 0;
 }
 
+// libssh2TraceHandler forwards libssh2's trace output to the transport logger.
+// Without a handler libssh2 writes trace via fprintf(stderr), which supervised
+// or remote agents do not capture; the context pointer is the *Transport.
+fn libssh2TraceHandler(
+    _: ?*ssh2.LIBSSH2_SESSION,
+    context: ?*anyopaque,
+    data: [*c]const u8,
+    length: usize,
+) callconv(.c) void {
+    const ctx = context orelse return;
+
+    if (data == null or length == 0) {
+        return;
+    }
+
+    const t: *Transport = @ptrCast(@alignCast(ctx));
+    t.log.debug("{s}", .{data[0..length]});
+}
+
+fn enableLibssh2Trace(t: *Transport, session: ?*ssh2.LIBSSH2_SESSION) void {
+    _ = ssh2.libssh2_trace_sethandler(session, t, libssh2TraceHandler);
+    _ = ssh2.libssh2_trace(
+        session,
+        ssh2.LIBSSH2_TRACE_PUBLICKEY |
+            ssh2.LIBSSH2_TRACE_CONN |
+            ssh2.LIBSSH2_TRACE_ERROR |
+            ssh2.LIBSSH2_TRACE_SOCKET |
+            ssh2.LIBSSH2_TRACE_TRANS |
+            ssh2.LIBSSH2_TRACE_KEX |
+            ssh2.LIBSSH2_TRACE_AUTH,
+    );
+}
+
 fn libssh2ChannelOpenSession(session: ?*ssh2.LIBSSH2_SESSION) ?*ssh2.LIBSSH2_CHANNEL {
     const channel_type = "session";
 
@@ -754,17 +787,7 @@ pub const Transport = struct {
         ssh2.libssh2_session_set_blocking(self.initial_session, 0);
 
         if (self.options.libssh2_trace) {
-            // best effort, but probably wont fail anyway :p
-            _ = ssh2.libssh2_trace(
-                self.initial_session,
-                ssh2.LIBSSH2_TRACE_PUBLICKEY |
-                    ssh2.LIBSSH2_TRACE_CONN |
-                    ssh2.LIBSSH2_TRACE_ERROR |
-                    ssh2.LIBSSH2_TRACE_SOCKET |
-                    ssh2.LIBSSH2_TRACE_TRANS |
-                    ssh2.LIBSSH2_TRACE_KEX |
-                    ssh2.LIBSSH2_TRACE_AUTH,
-            );
+            enableLibssh2Trace(self, self.initial_session);
         }
 
         while (true) {
@@ -1564,16 +1587,7 @@ pub const Transport = struct {
         }
 
         if (proxy_jump_options.libssh2_trace) {
-            _ = ssh2.libssh2_trace(
-                self.proxy_session.?,
-                ssh2.LIBSSH2_TRACE_PUBLICKEY |
-                    ssh2.LIBSSH2_TRACE_CONN |
-                    ssh2.LIBSSH2_TRACE_ERROR |
-                    ssh2.LIBSSH2_TRACE_SOCKET |
-                    ssh2.LIBSSH2_TRACE_TRANS |
-                    ssh2.LIBSSH2_TRACE_KEX |
-                    ssh2.LIBSSH2_TRACE_AUTH,
-            );
+            enableLibssh2Trace(self, self.proxy_session.?);
         }
 
         // we have to create a socket pair/pipe so we can give libssh2 a real socket -- we then
