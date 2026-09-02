@@ -27,9 +27,10 @@ fn libssh2InitializeOnce() c_int {
     return 0;
 }
 
-// libssh2TraceHandler forwards libssh2's trace output to the transport logger.
-// Without a handler libssh2 writes trace via fprintf(stderr), which supervised
-// or remote agents do not capture; the context pointer is the *Transport.
+// libssh2TraceHandler forwards libssh2's trace output to the transport logger
+// at trace level. Without a handler libssh2 writes trace via fprintf(stderr),
+// which supervised or remote agents do not capture; the context pointer is the
+// *Transport.
 fn libssh2TraceHandler(
     _: ?*ssh2.LIBSSH2_SESSION,
     context: ?*anyopaque,
@@ -43,7 +44,7 @@ fn libssh2TraceHandler(
     }
 
     const t: *Transport = @ptrCast(@alignCast(ctx));
-    t.log.debug("{s}", .{data[0..length]});
+    t.log.trace("{s}", .{data[0..length]});
 }
 
 fn enableLibssh2Trace(t: *Transport, session: ?*ssh2.LIBSSH2_SESSION) void {
