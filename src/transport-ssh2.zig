@@ -48,7 +48,9 @@ fn libssh2TraceHandler(
 }
 
 fn enableLibssh2Trace(t: *Transport, session: ?*ssh2.LIBSSH2_SESSION) void {
-    _ = ssh2.libssh2_trace_sethandler(session, t, libssh2TraceHandler);
+    if (t.log.f != null) {
+        _ = ssh2.libssh2_trace_sethandler(session, t, libssh2TraceHandler);
+    }
     _ = ssh2.libssh2_trace(
         session,
         ssh2.LIBSSH2_TRACE_PUBLICKEY |
