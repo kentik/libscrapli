@@ -4,20 +4,14 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const proc = std.process.run(
+    _ = try std.process.run(
         b.allocator,
         b.graph.io,
         .{
-            .cwd = .{ .path = b.build_root.path orelse "." },
+            .cwd = .{ .path = b.fmt("{f}", .{b.root}) },
             .argv = &[_][]const u8{"./generate.sh"},
         },
-    ) catch {
-        return std.Build.RunError.ExitCodeFailure;
-    };
-
-    if (proc.term.exited != 0) {
-        return std.Build.RunError.ExitCodeFailure;
-    }
+    );
 
     const crypto = libcrypto(b, target, optimize);
     crypto.installHeadersDirectory(
@@ -51,7 +45,7 @@ const cflags = &.{
 fn libssl(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.OptimizeMode,
 ) *std.Build.Step.Compile {
     const lib_mod = b.createModule(
         .{
@@ -181,7 +175,7 @@ fn libssl(
 fn libcrypto(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
+    optimize: std.lang.OptimizeMode,
 ) *std.Build.Step.Compile {
     const lib_mod = b.createModule(
         .{

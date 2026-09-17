@@ -15,67 +15,49 @@ const transport = @import("transport.zig");
 
 /// The default/standard ssh port.
 const default_ssh_port: u16 = 22;
-// THe default/standard telnet port.
+/// The default/standard telnet port.
 const default_telnet_port: u16 = 23;
+
+/// The default definition string.
+const default_definition_string =
+    \\---
+    \\prompt_pattern: '^.*[>#$]\s?+$'
+    \\default_mode: 'cli'
+    \\modes:
+    \\  - name: 'cli'
+    \\    prompt_pattern: '^.*[>#$]\s?+$'
+    \\on_close_instructions:
+    \\  - write:
+    \\      input: 'exit'
+;
 
 /// An enum representing possible sources for a (cli) definition.
 pub const DefinitionSource = union(enum) {
     string: []const u8,
     file: []const u8,
-    definition: *platform.Options,
-};
-
-/// A config object holding info for a cli driver.
-pub const Config = struct {
-    logger: ?logging.Logger = null,
-    definition: DefinitionSource,
-    port: ?u16 = null,
-    auth: auth.OptionsInputs = .{},
-    session: session.OptionsInputs = .{},
-    transport: transport.OptionsInputs = .{
-        .bin = .{},
-    },
+    // ownership note: string fields of the given definition are *copied*, but its modes map and
+    // any bound on open/close callbacks are *adopted* by the driver's definition -- once
+    // Driver.init has been called do not deinit or reuse the given definition. the only
+    // exception is when Driver.init fails while loading the definition itself (before the
+    // driver's own cleanup takes over), in which case the caller still owns those resources.
+    definition: *platform.Definition,
 };
 
 /// Options for the cli driver, driven from a config struct.
 pub const Options = struct {
-    allocator: std.mem.Allocator,
-    logger: ?logging.Logger,
-    port: ?u16,
-    auth: *auth.Options,
-    session: *session.Options,
-    transport: *transport.Options,
+    definition: DefinitionSource = .{
+        .string = default_definition_string,
+    },
+    logger: ?logging.Logger = null,
+    port: ?u16 = null,
+    auth: auth.Options = .{},
+    session: session.Options = .{},
+    transport: transport.Options = .{
+        .bin = .{},
+    },
 
-    /// Initializes the cli options.
-    pub fn init(allocator: std.mem.Allocator, config: Config) !*Options {
-        const o = try allocator.create(Options);
-        errdefer allocator.destroy(o);
-
-        o.* = Options{
-            .allocator = allocator,
-            .logger = config.logger,
-            .port = config.port,
-            .auth = try auth.Options.init(allocator, config.auth),
-            .session = try session.Options.init(allocator, config.session),
-            .transport = try transport.Options.init(
-                allocator,
-                config.transport,
-            ),
-        };
-
-        return o;
-    }
-
-    /// Deinitializes the cli options.
-    pub fn deinit(self: *Options) void {
-        self.auth.deinit();
-        self.session.deinit();
-        self.transport.deinit();
-        self.allocator.destroy(self);
-    }
-
-    fn validate(self: *Options, log: logging.Logger) !void {
-        switch (self.transport.*) {
+    fn validate(self: Options, log: logging.Logger) !void {
+        switch (self.transport) {
             .bin => {
                 if (self.auth.private_key_content != null) {
                     // its only a warning, for future things we may want to actually return errors
@@ -93,32 +75,43 @@ pub const Driver = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
     log: logging.Logger,
-    definition: *platform.Definition,
+    definition: platform.Definition,
     host: []const u8,
-    port: u16,
-    options: *Options,
-    session: *session.Session,
+    port: u16 = default_ssh_port,
+    session: session.Session,
     current_mode: []const u8 = mode.unknown_mode,
+
+    last_error: errors.LastError = .{},
 
     /// Initialize the cli driver.
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
         host: []const u8,
-        config: Config,
+        options: Options,
     ) !*Driver {
-        const opts = try Options.init(allocator, config);
-        errdefer opts.deinit();
-
-        const log = opts.logger orelse logging.Logger{
+        const log = options.logger orelse logging.Logger{
             .allocator = allocator,
         };
 
         logging.traceWithSrc(log, @src(), "cli.Driver initializing", .{});
 
-        try opts.validate(log);
+        try options.validate(log);
 
-        const definition = try Driver.loadDefinition(allocator, io, config.definition);
+        var definition = try Driver.loadDefinition(allocator, io, options.definition);
+        errdefer definition.deinit(allocator);
+
+        var s = try session.Session.init(
+            allocator,
+            io,
+            log,
+            definition.prompt_pattern,
+            definition.prompt_excludes,
+            options.session,
+            options.auth,
+            options.transport,
+        );
+        errdefer s.deinit();
 
         const d = try allocator.create(Driver);
 
@@ -128,21 +121,13 @@ pub const Driver = struct {
             .log = log,
             .definition = definition,
             .host = host,
-            .port = 0,
-            .options = opts,
-            .session = try session.Session.init(
-                allocator,
-                io,
-                log,
-                definition.prompt_pattern,
-                opts.session,
-                opts.auth,
-                opts.transport,
-            ),
+            .session = s,
         };
 
-        if (opts.port == null) {
-            switch (opts.transport.*) {
+        if (options.port) |p| {
+            d.port = p;
+        } else {
+            switch (options.transport) {
                 transport.Kind.telnet => {
                     d.port = default_telnet_port;
                 },
@@ -150,8 +135,6 @@ pub const Driver = struct {
                     d.port = default_ssh_port;
                 },
             }
-        } else {
-            d.port = opts.port.?;
         }
 
         return d;
@@ -162,16 +145,31 @@ pub const Driver = struct {
         logging.traceWithSrc(self.log, @src(), "cli.Driver deinitializing", .{});
 
         self.session.deinit();
-        self.definition.deinit();
-        self.options.deinit();
+        self.definition.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    /// Returns the last error for the driver, the session, or the transport. Slice only valid
+    /// as long as the error does not change and the driver/session/transport are not deinit'd.
+    pub fn getLastError(
+        self: *Driver,
+    ) []const u8 {
+        if (self.last_error.len > 0) {
+            return self.last_error.get();
+        }
+
+        if (self.session.last_error.len > 0) {
+            return self.session.last_error.get();
+        }
+
+        return self.session.transport.getLastError();
     }
 
     fn loadDefinition(
         allocator: std.mem.Allocator,
         io: std.Io,
         definition_source: DefinitionSource,
-    ) !*platform.Definition {
+    ) !platform.Definition {
         return switch (definition_source) {
             .string => |d| try platform.YamlDefinition.toDefinition(
                 allocator,
@@ -252,12 +250,12 @@ pub const Driver = struct {
             ),
         );
 
-        if (self.definition.onOpenCallback != null or
+        if (self.definition.on_open_callback != null or
             self.definition.bound_on_open_callback != null)
         {
             self.log.info("cli.Driver open: on open callback set, executing...", .{});
 
-            if (self.definition.onOpenCallback) |cb| {
+            if (self.definition.on_open_callback) |cb| {
                 try res.recordExtend(
                     try cb(
                         self,
@@ -286,6 +284,10 @@ pub const Driver = struct {
         options: operation.CloseOptions,
     ) !*result.Result {
         self.log.info("cli.Driver close requested", .{});
+        self.log.debug(
+            "cli.Driver close: force '{any}'",
+            .{options.force},
+        );
 
         var res = try self.newResult(
             allocator,
@@ -308,12 +310,12 @@ pub const Driver = struct {
             );
         };
 
-        if (self.definition.onCloseCallback != null or
-            self.definition.bound_on_close_callback != null)
+        if (!options.force and (self.definition.on_close_callback != null or
+            self.definition.bound_on_close_callback != null))
         {
             self.log.info("cli.Driver close: on close callback set, executing...", .{});
 
-            if (self.definition.onCloseCallback) |cb| {
+            if (self.definition.on_close_callback) |cb| {
                 try res.recordExtend(
                     try cb(
                         self,
@@ -375,6 +377,8 @@ pub const Driver = struct {
         );
 
         if (!self.definition.modes.contains(options.requested_mode)) {
+            self.last_error.set("cli.Driver requested mode not in definition");
+
             return errors.wrapCriticalError(
                 errors.ScrapliError.Operation,
                 @src(),
@@ -413,6 +417,8 @@ pub const Driver = struct {
             self.definition.modes,
             current_prompt,
         ) catch |err| {
+            self.last_error.set("cli.Driver enterMode: failed determining prompt");
+
             return errors.wrapCriticalError(
                 err,
                 @src(),
@@ -456,8 +462,9 @@ pub const Driver = struct {
                 break;
             }
 
-            const step_mode = self.definition.modes.get(step);
-            if (step_mode == null) {
+            const step_mode = self.definition.modes.get(step) orelse {
+                self.last_error.set("cli.Driver enterMode mode not in definition");
+
                 return errors.wrapCriticalError(
                     errors.ScrapliError.Operation,
                     @src(),
@@ -465,12 +472,13 @@ pub const Driver = struct {
                     "cli.Driver enterMode: no mode '{s}' in definition",
                     .{step},
                 );
-            }
+            };
 
             const next_mode_name = steps.items[step_idx + 1];
 
-            const next_operation = step_mode.?.accessible_modes.get(next_mode_name);
-            if (next_operation == null) {
+            const next_operation = step_mode.accessible_modes.get(next_mode_name) orelse {
+                self.last_error.set("cli.Driver enterMode mode not accessible from current mode");
+
                 return errors.wrapCriticalError(
                     errors.ScrapliError.Operation,
                     @src(),
@@ -478,9 +486,9 @@ pub const Driver = struct {
                     "cli.Driver enterMode: mode '{s}' not accessible from current mode '{s}'",
                     .{ next_mode_name, self.current_mode },
                 );
-            }
+            };
 
-            for (next_operation.?) |op| {
+            for (next_operation) |op| {
                 switch (op) {
                     .send_input => {
                         try res.recordExtend(
@@ -503,7 +511,7 @@ pub const Driver = struct {
                     .send_prompted_input => {
                         var response: []const u8 = "";
 
-                        if (self.options.auth.resolveAuthValue(
+                        if (self.session.auth_options.resolveAuthValue(
                             op.send_prompted_input.send_prompted_input.response,
                         )) |resolved_response| {
                             response = resolved_response;
@@ -661,62 +669,27 @@ pub const Driver = struct {
         );
         errdefer res.deinit();
 
-        if (options._ffi_inputs != null and options.inputs.len == 0) {
-            // annoying to have to do this for the ffi bits but this keeps the ffi able to very
-            // easily call this (rather than ranging over inputs and calling sendInput from the
-            // calling program) so we have consistent behavior
-            var ffi_inputs_iterator = std.mem.splitSequence(
-                u8,
-                options._ffi_inputs.?,
-                bytes.libscrapli_delimiter,
+        for (options.inputs) |input| {
+            try res.record(
+                .{
+                    .input = input,
+                    .rets = try self.session.sendInput(
+                        allocator,
+                        .{
+                            .cancel = options.cancel,
+                            .input = input,
+                            .requested_mode = options.requested_mode,
+                            .input_handling = options.input_handling,
+                            .retain_input = options.retain_input,
+                            .retain_trailing_prompt = options.retain_trailing_prompt,
+                            ._mode_prompt_pattern = self.modePromptPattern(target_mode),
+                        },
+                    ),
+                },
             );
 
-            while (ffi_inputs_iterator.next()) |input| {
-                try res.record(
-                    .{
-                        .input = input,
-                        .rets = try self.session.sendInput(
-                            allocator,
-                            .{
-                                .cancel = options.cancel,
-                                .input = input,
-                                .requested_mode = options.requested_mode,
-                                .input_handling = options.input_handling,
-                                .retain_input = options.retain_input,
-                                .retain_trailing_prompt = options.retain_trailing_prompt,
-                                ._mode_prompt_pattern = self.modePromptPattern(target_mode),
-                            },
-                        ),
-                    },
-                );
-
-                if (options.stop_on_indicated_failure and res.result_failure_indicated) {
-                    return res;
-                }
-            }
-        } else {
-            for (options.inputs) |input| {
-                try res.record(
-                    .{
-                        .input = input,
-                        .rets = try self.session.sendInput(
-                            allocator,
-                            .{
-                                .cancel = options.cancel,
-                                .input = input,
-                                .requested_mode = options.requested_mode,
-                                .input_handling = options.input_handling,
-                                .retain_input = options.retain_input,
-                                .retain_trailing_prompt = options.retain_trailing_prompt,
-                                ._mode_prompt_pattern = self.modePromptPattern(target_mode),
-                            },
-                        ),
-                    },
-                );
-
-                if (options.stop_on_indicated_failure and res.result_failure_indicated) {
-                    return res;
-                }
+            if (options.stop_on_indicated_failure and res.result_failure_indicated) {
+                return res;
             }
         }
 
@@ -801,20 +774,24 @@ pub const Driver = struct {
 
     fn innerReadWithCallbacks(
         self: *Driver,
-        timer: *std.time.Timer,
+        allocator: std.mem.Allocator,
+        start_timestamp: std.Io.Timestamp,
         cancel: ?*bool,
         callbacks: []const operation.ReadCallback,
         bufs: *bytes.ProcessedBuf,
         buf_pos: usize,
         triggered_callbacks: *std.ArrayList([]const u8),
     ) !void {
+        var t = start_timestamp;
+
         while (true) {
             _ = try self.session.readTimeout(
-                timer,
+                t,
                 cancel,
                 bytes_check.nonZeroBuf,
                 .{},
                 bufs,
+                self.session.options.operation_max_search_depth,
             );
 
             for (callbacks) |callback| {
@@ -837,12 +814,16 @@ pub const Driver = struct {
                     callback.options.only_once,
                     triggered_callbacks,
                 ) catch |err| {
+                    self.last_error.set(
+                        "cli.Driver readWithCallbacks failed determining if callback should execute",
+                    );
+
                     return errors.wrapCriticalError(
                         err,
                         @src(),
                         self.log,
-                        "cli.Driver readWithCallbacks: failed compling contains pattern '{s}'",
-                        .{callback.options.contains_pattern},
+                        "cli.Driver readWithCallbacks failed determining if callback should execute",
+                        .{},
                     );
                 };
 
@@ -876,13 +857,14 @@ pub const Driver = struct {
                 }
 
                 if (callback.options.reset_timer) {
-                    timer.reset();
+                    t = std.Io.Timestamp.now(self.io, .awake);
                 }
 
-                try triggered_callbacks.append(callback.options.name);
+                try triggered_callbacks.append(allocator, callback.options.name);
 
                 return self.innerReadWithCallbacks(
-                    timer,
+                    allocator,
+                    t,
                     cancel,
                     callbacks,
                     bufs,
@@ -904,7 +886,7 @@ pub const Driver = struct {
         self.log.info("cli.Driver readWithCallbacks requested", .{});
         self.log.debug(
             "cli.Driver readWithCallbacks: initial_input '{s}'",
-            .{options.initial_input},
+            .{options.initial_input orelse "n/a"},
         );
 
         var res = try self.newResult(
@@ -913,20 +895,21 @@ pub const Driver = struct {
         );
         errdefer res.deinit();
 
-        var t = try std.time.Timer.start();
+        const start_time = std.Io.Timestamp.now(self.io, .awake);
 
         if (options.initial_input) |initial_input| {
             try self.session.writeAndReturn(initial_input, false);
         }
 
-        var bufs = bytes.ProcessedBuf.init(allocator);
-        defer bufs.deinit();
+        var bufs = bytes.ProcessedBuf.init();
+        defer bufs.deinit(allocator);
 
         var triggered_callbacks: std.ArrayList([]const u8) = .empty;
         defer triggered_callbacks.deinit(allocator);
 
         try self.innerReadWithCallbacks(
-            &t,
+            allocator,
+            start_time,
             options.cancel,
             options.callbacks,
             &bufs,
@@ -937,7 +920,7 @@ pub const Driver = struct {
         try res.record(
             .{
                 .input = options.initial_input orelse "",
-                .rets = try bufs.toOwnedSlices(),
+                .rets = try bufs.toOwnedSlices(allocator),
                 // this may be the only place we *dont* want to trim whitespace
                 // .trim_processed = false,
             },
@@ -958,12 +941,12 @@ pub const Driver = struct {
     ) !void {
         self.log.info("cli.Driver replaceDefinition requested", .{});
 
-        const new_definition = try Driver.loadDefinition(
+        var new_definition = try Driver.loadDefinition(
             self.allocator,
             self.io,
             definition_source,
         );
-        errdefer new_definition.deinit();
+        errdefer new_definition.deinit(self.allocator);
 
         const pattern_changed = !std.mem.eql(
             u8,
@@ -974,9 +957,9 @@ pub const Driver = struct {
         var new_compiled_pattern = self.session.compiled_prompt_pattern;
 
         if (pattern_changed) {
-            new_compiled_pattern = re.pcre2Compile(new_definition.prompt_pattern);
+            new_compiled_pattern = re.pcre2Compile(new_definition.prompt_pattern) orelse {
+                self.last_error.set("cli.replaceDefinition failed compiling prompt pattern");
 
-            if (new_compiled_pattern == null) {
                 return errors.wrapCriticalError(
                     errors.ScrapliError.Driver,
                     @src(),
@@ -984,18 +967,21 @@ pub const Driver = struct {
                     "cli.replaceDefinition: failed compiling prompt pattern {s}",
                     .{new_definition.prompt_pattern},
                 );
-            }
+            };
         }
 
-        self.definition.deinit();
+        self.definition.deinit(self.allocator);
         self.definition = new_definition;
+
+        self.current_mode = mode.unknown_mode;
+        self.session.prompt_pattern = new_definition.prompt_pattern;
+        self.session.prompt_excludes = new_definition.prompt_excludes;
 
         if (pattern_changed) {
             if (self.session.compiled_prompt_pattern) |p| {
                 re.pcre2Free(p);
             }
 
-            self.session.prompt_pattern = new_definition.prompt_pattern;
             self.session.compiled_prompt_pattern = new_compiled_pattern;
         }
     }
@@ -1032,15 +1018,14 @@ pub fn readCallbackShouldExecute(
             callback_contains_or_pattern_matches = true;
         }
     } else if (contains_pattern) |cp| {
-        const compiled_cp = re.pcre2Compile(cp);
-        if (compiled_cp == null) {
+        const compiled_cp = re.pcre2Compile(cp) orelse {
             return errors.ScrapliError.Operation;
-        }
+        };
 
-        defer re.pcre2Free(compiled_cp.?);
+        defer re.pcre2Free(compiled_cp);
 
         const match = try re.pcre2Find(
-            compiled_cp.?,
+            compiled_cp,
             buf,
         );
         if (match != null) {
@@ -1133,4 +1118,45 @@ test "readCallbackShouldExecute" {
 
         try std.testing.expectEqual(case.expected, actual);
     }
+}
+
+test "refAllDecls" {
+    std.testing.refAllDecls(Driver);
+}
+
+fn driverInitForAllocFailures(allocator: std.mem.Allocator) !void {
+    // note: this deliberately passes a pre-built definition rather than exercising the default
+    // (yaml string) definition source -- zig-yaml's Value.fromNode has a bug in its error
+    // cleanup path where the errdefer deinits a just-inserted (still undefined) map value when
+    // a child allocation fails, panicking with "switch on corrupt value" under failure
+    // injection. the yaml -> definition path is otherwise covered by
+    // definitionInitAllocationFailures (cli-platform.zig) minus the yaml parse itself.
+    // thank you to our friend clawd for helping figuring this one out, even if im not fully
+    // sure i am satisified w/ the explanation since it only happens in release safe and is not
+    // reproducible on darwin? so thats weird
+    var definition = platform.Definition{
+        .prompt_pattern = "^.*[>#$]\\s?+$",
+        .default_mode = "cli",
+    };
+
+    const d = try Driver.init(
+        allocator,
+        std.testing.io,
+        "localhost",
+        .{
+            .definition = .{
+                .definition = &definition,
+            },
+        },
+    );
+
+    d.deinit();
+}
+
+test "driverInitAllocationFailures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        driverInitForAllocFailures,
+        .{},
+    );
 }

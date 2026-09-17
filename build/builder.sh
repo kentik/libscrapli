@@ -19,6 +19,10 @@ fi
 cd libscrapli
 
 # hack to get openssl to not break on first build? i dunno... whatever
+# NOTE(kentik): keep this step (with -Dtarget) even though upstream removed it --
+# it fixes libscrapli's own docker build path so the statically linked openssl is
+# built for the same target/CPU baseline as the rest of libscrapli, avoiding a
+# CPU-feature mismatch. See docs/SIGILL-INVESTIGATION-REPORT.md section 0.6.
 cd lib/openssl
 zig build "-Dtarget=${LIBSCRAPLI_TARGET}"
 cd ../..
