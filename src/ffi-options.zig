@@ -9,37 +9,6 @@ const netconf_operation = @import("netconf-operation.zig");
 const session = @import("session.zig");
 const transport = @import("transport.zig");
 
-fn getTransport(transport_kind: []const u8) transport.Kind {
-    if (std.mem.eql(
-        u8,
-        transport_kind,
-        @tagName(transport.Kind.bin),
-    )) {
-        return transport.Kind.bin;
-    } else if (std.mem.eql(
-        u8,
-        transport_kind,
-        @tagName(transport.Kind.telnet),
-    )) {
-        return transport.Kind.telnet;
-    } else if (std.mem.eql(
-        u8,
-        transport_kind,
-        @tagName(transport.Kind.ssh2),
-    )) {
-        return transport.Kind.ssh2;
-    } else if (std.mem.eql(
-        u8,
-        transport_kind,
-        @tagName(transport.Kind.test_),
-    )) {
-        return transport.Kind.test_;
-    } else {
-        // zlinter-disable-next-line no_panic - should never happen
-        @panic("unsupported transport");
-    }
-}
-
 // zlinter-disable no_undefined
 /// An options struct that can have fields set from a calling language (i.e. py/go).
 /// note: many fields are optional pointers because we cant just have ?u64 on extern struct
@@ -48,22 +17,21 @@ fn getTransport(transport_kind: []const u8) transport.Kind {
 /// because we check the length -- if the length is non zero then we know it was something,
 /// there shouldnt be any fields here where an empty string is a valid user input
 pub const FFIOptions = extern struct {
+    user_data: usize,
+
     loggerCallback: ?*const fn (
+        user_data: usize,
         level: u8,
         message: *const []u8,
     ) callconv(.c) void = null,
-    logger_level: [*c]const u8 = undefined,
-    logger_level_len: usize = 0,
+    logger_level: u8 = 4,
 
     port: ?*u16 = null,
-    transport_kind: [*c]const u8 = undefined,
-    transport_kind_len: usize = 0,
+    transport_kind: u8 = 1,
 
     cli: extern struct {
         definition_str: [*c]const u8 = undefined,
         definition_str_len: usize = 0,
-        normalize_line_feeds: ?*bool = null,
-        normalize_trailing_whitespace: ?*bool = null,
     },
 
     netconf: extern struct {
@@ -73,6 +41,7 @@ pub const FFIOptions = extern struct {
         preferred_version_len: usize = 0,
         message_poll_interval: ?*u64 = null,
         capabilitiesCallback: ?*const fn (
+            user_data: usize,
             cap_buf: *[]const u8,
         ) callconv(.c) *[]const u8 = null,
     },
@@ -88,8 +57,15 @@ pub const FFIOptions = extern struct {
         record_destination: [*c]const u8 = undefined,
         record_destination_len: usize = 0,
         recordCallback: ?*const fn (
+            user_data: usize,
             buf: *const []u8,
         ) callconv(.c) void = null,
+        scratch_initial_size: ?*u64 = null,
+        scratch_retain_max: ?*u64 = null,
+
+        // note that these are explicilty overwritten/ignored when driver is netconf
+        normalize_line_feeds: ?*bool = null,
+        normalize_trailing_whitespace: ?*bool = null,
     },
 
     auth: extern struct {
@@ -160,8 +136,8 @@ pub const FFIOptions = extern struct {
     },
     // zlinter-enable no_undefined
 
-    fn authOptionsInputs(self: *FFIOptions) auth.OptionsInputs {
-        var o = auth.OptionsInputs{};
+    fn authOptionsInputs(self: *FFIOptions) auth.Options {
+        var o = auth.Options{};
 
         if (self.auth.username_len > 0) {
             o.username = self.auth.username[0..self.auth.username_len];
@@ -220,8 +196,8 @@ pub const FFIOptions = extern struct {
         return o;
     }
 
-    fn sessionOptionsInputs(self: *FFIOptions) session.OptionsInputs {
-        var o = session.OptionsInputs{};
+    fn sessionOptionsInputs(self: *FFIOptions) session.Options {
+        var o = session.Options{};
 
         if (self.session.read_size) |d| {
             o.read_size = d.*;
@@ -253,17 +229,38 @@ pub const FFIOptions = extern struct {
             };
         } else if (self.session.recordCallback) |cb| {
             o.record_destination = .{
-                .cb = cb,
+                .ffi = .{
+                    .user_data = self.user_data,
+                    .cb = cb,
+                },
             };
+        }
+
+        if (self.session.scratch_initial_size) |d| {
+            o.scratch_initial_size = d.*;
+        }
+
+        if (self.session.scratch_retain_max) |d| {
+            o.scratch_retain_max = d.*;
+        }
+
+        if (self.session.normalize_line_feeds) |lf| {
+            o.normalize_line_feeds = lf.*;
+        }
+
+        if (self.session.normalize_trailing_whitespace) |ws| {
+            o.normalize_trailing_whitespace = ws.*;
         }
 
         return o;
     }
 
-    fn transportOptionsInputs(self: *FFIOptions) transport.OptionsInputs {
-        switch (getTransport(self.transport_kind[0..self.transport_kind_len])) {
+    fn transportOptionsInputs(self: *FFIOptions) transport.Options {
+        const transport_kind: transport.Kind = @fromBackingInt(@intCast(self.transport_kind));
+
+        switch (transport_kind) {
             transport.Kind.bin => {
-                var o = transport.OptionsInputs{
+                var o = transport.Options{
                     .bin = .{},
                 };
 
@@ -302,7 +299,7 @@ pub const FFIOptions = extern struct {
                 return o;
             },
             transport.Kind.ssh2 => {
-                var o = transport.OptionsInputs{
+                var o = transport.Options{
                     .ssh2 = .{},
                 };
 
@@ -347,7 +344,7 @@ pub const FFIOptions = extern struct {
                 return o;
             },
             transport.Kind.test_ => {
-                var o = transport.OptionsInputs{
+                var o = transport.Options{
                     .test_ = .{},
                 };
 
@@ -358,27 +355,30 @@ pub const FFIOptions = extern struct {
                 return o;
             },
             transport.Kind.telnet => {
-                return transport.OptionsInputs{
+                return transport.Options{
                     .telnet = .{},
                 };
             },
         }
     }
 
-    /// Returns a cli config from this ffi options struct.
-    pub fn cliConfig(self: *FFIOptions, allocator: std.mem.Allocator) cli.Config {
+    /// Returns a cli options struct from this ffi options struct.
+    pub fn cliOptions(self: *FFIOptions, allocator: std.mem.Allocator) cli.Options {
         var l: ?logging.Logger = null;
         if (self.loggerCallback) |cb| {
             l = logging.Logger{
                 .allocator = allocator,
-                .f = cb,
-                .level = logging.LogLevel.fromString(
-                    self.logger_level[0..self.logger_level_len],
-                ),
+                .f = .{
+                    .ffi = .{
+                        .user_data = self.user_data,
+                        .cb = cb,
+                    },
+                },
+                .level = @fromBackingInt(@intCast(self.logger_level)),
             };
         }
 
-        return cli.Config{
+        return cli.Options{
             .logger = l,
             .definition = .{
                 .string = self.cli.definition_str[0..self.cli.definition_str_len],
@@ -390,29 +390,38 @@ pub const FFIOptions = extern struct {
         };
     }
 
-    /// Returns a netconf config from this ffi options struct.
-    pub fn netconfConfig(self: *FFIOptions, allocator: std.mem.Allocator) netconf.Config {
+    /// Returns a netconf options struct from this ffi options struct.
+    pub fn netconfOptions(self: *FFIOptions, allocator: std.mem.Allocator) netconf.Options {
         var l: ?logging.Logger = null;
         if (self.loggerCallback) |cb| {
             l = logging.Logger{
                 .allocator = allocator,
-                .f = cb,
-                .level = logging.LogLevel.fromString(
-                    self.logger_level[0..self.logger_level_len],
-                ),
+                .f = .{
+                    .ffi = .{
+                        .user_data = self.user_data,
+                        .cb = cb,
+                    },
+                },
+                .level = @fromBackingInt(@intCast(self.logger_level)),
             };
         }
 
-        var c = netconf.Config{
+        var c = netconf.Options{
             .logger = l,
-            .port = if (self.port) |v| v.* else null,
             .auth = self.authOptionsInputs(),
             .session = self.sessionOptionsInputs(),
             .transport = self.transportOptionsInputs(),
             .capabilities_callback = if (self.netconf.capabilitiesCallback) |cb| .{
-                .ffi = cb,
+                .ffi = .{
+                    .user_data = self.user_data,
+                    .cb = cb,
+                },
             } else null,
         };
+
+        if (self.port) |p| {
+            c.port = p.*;
+        }
 
         if (self.netconf.error_tag_len > 0) {
             c.error_tag = self.netconf.error_tag[0..self.netconf.error_tag_len];
@@ -454,7 +463,7 @@ export fn ls_fetch_options_size(
 
     options_json_len.* = opt_string.len;
 
-    return @intFromEnum(ffi_common.FfiResult.success);
+    return @backingInt(ffi_common.FfiResult.success);
 }
 
 export fn ls_fetch_options(
@@ -473,7 +482,7 @@ export fn ls_fetch_options(
 
     @memcpy(options_json.*[0..], opt_string);
 
-    return @intFromEnum(ffi_common.FfiResult.success);
+    return @backingInt(ffi_common.FfiResult.success);
 }
 
 fn optU16(val: ?*const u16) ?u16 {
@@ -507,21 +516,21 @@ const ffi_options_top_level_args_json_ish_placeholder =
 ;
 
 fn ffiOptionsTopLevelToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    const transport_kind: transport.Kind = @fromBackingInt(@intCast(o.transport_kind));
+    const logger_level: logging.LogLevel = @fromBackingInt(@intCast(o.logger_level));
+
+    return allocator.print(
         ffi_options_top_level_args_json_ish_placeholder,
         .{
-            cStr(o.logger_level, o.logger_level_len),
-            cStr(o.transport_kind, o.transport_kind_len),
+            @tagName(logger_level),
+            transport_kind.toString(),
             optU16(o.port),
         },
     );
 }
 
 const ffi_options_cli_args_json_ish_placeholder =
-    \\    "definition_str": "{s}",
-    \\    "normalize_line_feeds": "{any}",
-    \\    "normalize_trailing_whitespace": "{any}"
+    \\    "definition_str": "{s}"
 ;
 
 fn ffiOptionsCLIToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8 {
@@ -538,13 +547,10 @@ fn ffiOptionsCLIToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8
 
     _ = encoder.encode(encoded, raw);
 
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         ffi_options_cli_args_json_ish_placeholder,
         .{
             encoded,
-            optBool(o.cli.normalize_line_feeds),
-            optBool(o.cli.normalize_trailing_whitespace),
         },
     );
 }
@@ -556,8 +562,7 @@ const ffi_options_netconf_args_json_ish_placeholder =
 ;
 
 fn ffiOptionsNETCONFToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         ffi_options_netconf_args_json_ish_placeholder,
         .{
             cStr(o.netconf.error_tag, o.netconf.error_tag_len),
@@ -574,12 +579,15 @@ const ffi_options_session_args_json_ish_placeholder =
     \\    "return_char": "{s}",
     \\    "operation_timeout_ns": {any},
     \\    "operation_max_search_depth": {any},
-    \\    "record_destination": "{s}"
+    \\    "scratch_initial_size": {any},
+    \\    "scratch_retain_max": {any},
+    \\    "record_destination": "{s}",
+    \\    "normalize_line_feeds": "{any}",
+    \\    "normalize_trailing_whitespace": "{any}"
 ;
 
 fn ffiOptionsSessionToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         ffi_options_session_args_json_ish_placeholder,
         .{
             optU64(o.session.read_size),
@@ -588,7 +596,11 @@ fn ffiOptionsSessionToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) !
             cStr(o.session.return_char, o.session.return_char_len),
             optU64(o.session.operation_timeout_ns),
             optU64(o.session.operation_max_search_depth),
+            optU64(o.session.scratch_initial_size),
+            optU64(o.session.scratch_retain_max),
             cStr(o.session.record_destination, o.session.record_destination_len),
+            optBool(o.session.normalize_line_feeds),
+            optBool(o.session.normalize_trailing_whitespace),
         },
     );
 }
@@ -608,8 +620,7 @@ const ffi_options_auth_args_json_ish_placeholder =
 ;
 
 fn ffiOptionsAuthToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         ffi_options_auth_args_json_ish_placeholder,
         .{
             cStr(o.auth.username, o.auth.username_len),
@@ -639,8 +650,7 @@ const ffi_options_transport_bin_args_json_ish_placeholder =
 ;
 
 fn ffiOptionsTransportBinToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         ffi_options_transport_bin_args_json_ish_placeholder,
         .{
             cStr(o.transport.bin.bin, o.transport.bin.bin_len),
@@ -668,8 +678,7 @@ const ffi_options_transport_ssh2_args_json_ish_placeholder =
 ;
 
 fn ffiOptionsTransportSSH2ToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         ffi_options_transport_ssh2_args_json_ish_placeholder,
         .{
             cStr(o.transport.ssh2.known_hosts_path, o.transport.ssh2.known_hosts_path_len),
@@ -690,8 +699,7 @@ const ffi_options_transport_test_args_json_ish_placeholder =
 ;
 
 fn ffiOptionsTransportTestToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8 {
-    return std.fmt.allocPrint(
-        allocator,
+    return allocator.print(
         ffi_options_transport_test_args_json_ish_placeholder,
         .{
             cStr(o.transport.test_.f, o.transport.test_.f_len),
@@ -756,8 +764,7 @@ fn ffiOptionsToJSON(
     const tt = try ffiOptionsTransportTestToJSON(allocator, o);
     defer allocator.free(tt);
 
-    const final_json = try std.fmt.allocPrint(
-        allocator,
+    const final_json = try allocator.print(
         ffi_options_json_ish_placeholder,
         .{
             top,

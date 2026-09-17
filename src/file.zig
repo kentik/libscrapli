@@ -1,5 +1,7 @@
 const std = @import("std");
 
+const errors = @import("errors.zig");
+
 /// Conveinence function to set the given fd to be in non block.
 pub fn setNonBlocking(fd: std.posix.fd_t) !void {
     var flags = std.posix.system.fcntl(
@@ -8,7 +10,7 @@ pub fn setNonBlocking(fd: std.posix.fd_t) !void {
         @as(usize, 0),
     );
     if (flags == -1) {
-        return error.CError;
+        return errors.ScrapliError.CError;
     }
 
     // would have thought there would be a portable std.posix.O.NONBLOCK but
@@ -24,7 +26,7 @@ pub fn setNonBlocking(fd: std.posix.fd_t) !void {
         flags,
     );
     if (rc == -1) {
-        return error.CError;
+        return errors.ScrapliError.CError;
     }
 }
 
@@ -42,6 +44,7 @@ pub fn readerFromPath(
 /// Conveinence function to read teh contents of a file at path, owner owns returned memory.
 pub fn readFromPath(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
     const f = try std.Io.Dir.openFile(std.Io.Dir.cwd(), io, path, .{});
+    defer f.close(io);
 
     var r_buf: [1024]u8 = undefined;
     var r = f.reader(io, &r_buf);

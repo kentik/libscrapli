@@ -3,12 +3,7 @@ const std = @import("std");
 const bytes = @import("bytes.zig");
 const operation = @import("cli-operation.zig");
 
-/// Holds options related to how a result should look.
-pub const GetResultOptions = struct {
-    delimiter: []const u8 = "\n",
-    normalize_line_feeds: bool = true,
-    normalize_trailing_whitespace: bool = true,
-};
+const result_join_delimiter = "\n";
 
 /// Holds result information for Cli opereations.
 pub const Result = struct {
@@ -20,11 +15,11 @@ pub const Result = struct {
 
     operation_kind: operation.Kind,
 
-    failed_indicators: ?std.ArrayList([]const u8),
+    failed_indicators: ?[]const []const u8,
 
     inputs: std.ArrayList([]const u8),
 
-    results_raw: std.ArrayList([]const u8),
+    results_raw_journal: std.ArrayList([]const u8),
     results: std.ArrayList([]const u8),
 
     start_time_ns: i128,
@@ -37,14 +32,14 @@ pub const Result = struct {
     result_failure_indicator: i16,
 
     /// Initializes a heap allocated Result object, this object *does not own* the failed_indicators
-    /// arraylist and will *not* free any of that memory!
+    /// slice and will *not* free any of that memory!
     pub fn init(
         allocator: std.mem.Allocator,
         io: std.Io,
         host: []const u8,
         port: u16,
         operation_kind: operation.Kind,
-        failed_indicators: ?std.ArrayList([]const u8),
+        failed_indicators: ?[]const []const u8,
     ) !*Result {
         const res = try allocator.create(Result);
 
@@ -56,7 +51,7 @@ pub const Result = struct {
             .operation_kind = operation_kind,
             .failed_indicators = failed_indicators,
             .inputs = .empty,
-            .results_raw = .empty,
+            .results_raw_journal = .empty,
             .results = .empty,
             .start_time_ns = std.Io.Timestamp.now(io, .real).nanoseconds,
             .splits_ns = .empty,
@@ -71,7 +66,7 @@ pub const Result = struct {
     pub fn deinit(
         self: *Result,
     ) void {
-        for (self.results_raw.items) |result_raw| {
+        for (self.results_raw_journal.items) |result_raw| {
             self.allocator.free(result_raw);
         }
 
@@ -79,7 +74,11 @@ pub const Result = struct {
             self.allocator.free(result);
         }
 
-        self.results_raw.deinit(self.allocator);
+        for (self.inputs.items) |input| {
+            self.allocator.free(input);
+        }
+
+        self.results_raw_journal.deinit(self.allocator);
         self.results.deinit(self.allocator);
         self.inputs.deinit(self.allocator);
         self.splits_ns.deinit(self.allocator);
@@ -96,8 +95,8 @@ pub const Result = struct {
         },
     ) !void {
         try self.splits_ns.append(self.allocator, std.Io.Timestamp.now(self.io, .real).nanoseconds);
-        try self.inputs.append(self.allocator, data.input);
-        try self.results_raw.append(self.allocator, data.rets[0]);
+        try self.inputs.append(self.allocator, try self.allocator.dupe(u8, data.input));
+        try self.results_raw_journal.append(self.allocator, data.rets[0]);
 
         try self.results.append(self.allocator, data.rets[1]);
 
@@ -105,7 +104,7 @@ pub const Result = struct {
             return;
         }
 
-        for (0.., self.failed_indicators.?.items) |idx, failed_when| {
+        for (0.., self.failed_indicators.?) |idx, failed_when| {
             if (std.mem.find(
                 u8,
                 self.results.items[self.results.items.len - 1],
@@ -126,18 +125,11 @@ pub const Result = struct {
         self: *Result,
         res: *Result,
     ) !void {
-        const owned_inputs = try res.inputs.toOwnedSlice(self.allocator);
-        defer self.allocator.free(owned_inputs);
-        const owned_results_raw = try res.results_raw.toOwnedSlice(self.allocator);
-        defer self.allocator.free(owned_results_raw);
-        const owned_results = try res.results.toOwnedSlice(self.allocator);
-        defer self.allocator.free(owned_results);
-
-        for (0.., owned_results_raw) |idx, _| {
+        for (0.., res.results_raw_journal.items) |idx, _| {
             try self.splits_ns.append(self.allocator, res.splits_ns.items[idx]);
-            try self.inputs.append(self.allocator, owned_inputs[idx]);
-            try self.results_raw.append(self.allocator, owned_results_raw[idx]);
-            try self.results.append(self.allocator, owned_results[idx]);
+            try self.inputs.append(self.allocator, res.inputs.items[idx]);
+            try self.results_raw_journal.append(self.allocator, res.results_raw_journal.items[idx]);
+            try self.results.append(self.allocator, res.results.items[idx]);
 
             if (!self.result_failure_indicated and res.result_failure_indicated) {
                 self.result_failure_indicated = true;
@@ -145,7 +137,12 @@ pub const Result = struct {
             }
         }
 
-        res.results_raw.deinit(self.allocator);
+        res.inputs.clearRetainingCapacity();
+        res.results_raw_journal.clearRetainingCapacity();
+        res.results.clearRetainingCapacity();
+        res.splits_ns.clearRetainingCapacity();
+
+        res.results_raw_journal.deinit(self.allocator);
         res.results.deinit(self.allocator);
         res.inputs.deinit(self.allocator);
         res.splits_ns.deinit(self.allocator);
@@ -187,285 +184,273 @@ pub const Result = struct {
         return secs_rounded;
     }
 
-    /// Gets the input length, used for ensuring we have properly sized buffers when passing a
-    /// result out of zig into the ffi layer.
-    pub fn getInputLen(
-        self: *Result,
-        options: GetResultOptions,
-    ) usize {
-        var out_size: usize = 0;
-
-        for (0.., self.inputs.items) |idx, input| {
-            out_size += input.len;
-
-            if (idx != self.inputs.items.len - 1) {
-                // not last result, add spacing for the delimiter
-                out_size += options.delimiter.len;
-            }
-        }
-
-        return out_size;
-    }
-
-    /// Gets the raw result length, used for ensuring we have properly sized buffers when passing a
-    /// result out of zig into the ffi layer.
+    /// Gets the raw result length -- the size of all *reconstructed* raw entries joined on
+    /// newlines. Used for sizing the buffer passed to getResultRawPreAllocated.
     pub fn getResultRawLen(
         self: *Result,
-        options: GetResultOptions,
-    ) usize {
+    ) !usize {
         var out_size: usize = 0;
 
-        for (0.., self.results_raw.items) |idx, result_raw| {
-            out_size += result_raw.len;
+        for (0.., self.results_raw_journal.items) |idx, result_raw_journal| {
+            // results_raw_journal holds each entry's *journaled* raw (see bytes.zig) -- the size
+            // we report would be the full size of the "reconstructed" raw output.
+            out_size += try bytes.reconstructedRawLen(
+                result_raw_journal,
+                self.results.items[idx].len,
+            );
 
-            if (idx != self.results_raw.items.len - 1) {
-                // not last result, add spacing for the delimiter
-                out_size += options.delimiter.len;
+            if (idx != self.results_raw_journal.items.len - 1) {
+                out_size += result_join_delimiter.len;
             }
         }
 
         return out_size;
     }
 
-    /// Returns all raw results joined on a options.delim string, caller owns joined string.
+    /// Returns all raw results joined on newlines, caller owns joined string. Note that this
+    /// *reconstructs* the raw output from each entry's (journaled raw, processed) pair -- raw
+    /// is never retained anywhere, only rebuilt on demand.
     pub fn getResultRaw(
         self: *Result,
         allocator: std.mem.Allocator,
-        options: GetResultOptions,
     ) ![]const u8 {
         const out = try allocator.alloc(
             u8,
-            self.getResultRawLen(
-                .{
-                    .delimiter = options.delimiter,
-                },
-            ),
+            try self.getResultRawLen(),
+        );
+        errdefer allocator.free(out);
+
+        try self.getResultRawPreAllocated(out);
+
+        return out;
+    }
+
+    /// Returns all raw results joined on newlines, but expects user to have already allocated
+    /// buf to the appropriate size (hint: use getResultRawLen). Reconstructs each entry's raw
+    /// from its (journaled raw, processed) pair.
+    pub fn getResultRawPreAllocated(
+        self: *Result,
+        out: []u8,
+    ) !void {
+        var cur: usize = 0;
+
+        for (0.., self.results_raw_journal.items) |idx, result_raw_journal| {
+            const entry_raw = try bytes.reconstructRaw(
+                self.allocator,
+                result_raw_journal,
+                self.results.items[idx],
+            );
+            defer self.allocator.free(entry_raw);
+
+            // bounded + alias-tolerant: out may be a caller-owned ffi buffer sized by a separate
+            // sizes call, so a mismatch must truncate rather than abort the host via @memcpy.
+            bytes.ffiCopyAt(out, cur, entry_raw);
+            cur += entry_raw.len;
+
+            if (idx != self.results_raw_journal.items.len - 1) {
+                for (result_join_delimiter) |delimiter_char| {
+                    if (cur < out.len) out[cur] = delimiter_char;
+                    cur += 1;
+                }
+            }
+        }
+    }
+
+    /// Gets the result length -- all entries joined on newlines. Used for sizing the buffer
+    /// passed to getResultPreAllocated.
+    pub fn getResultLen(
+        self: *Result,
+    ) usize {
+        var out_size: usize = 0;
+
+        for (0.., self.results.items) |idx, result| {
+            out_size += result.len;
+
+            if (idx != self.results.items.len - 1) {
+                out_size += result_join_delimiter.len;
+            }
+        }
+
+        return out_size;
+    }
+
+    /// Returns all results joined on newlines, caller owns joined string.
+    pub fn getResult(
+        self: *Result,
+        allocator: std.mem.Allocator,
+    ) ![]const u8 {
+        const out = try allocator.alloc(
+            u8,
+            self.getResultLen(),
         );
 
-        var cur: usize = 0;
-        for (0.., self.results_raw.items) |idx, result_raw| {
-            @memcpy(out[cur .. cur + result_raw.len], result_raw);
-            cur += result_raw.len;
+        self.getResultPreAllocated(out);
 
-            if (idx != self.results_raw.items.len - 1) {
-                for (options.delimiter) |delimiter_char| {
+        return out;
+    }
+
+    /// Returns all results joined on newlines, but expects user to have already allocated buf
+    /// to the appropriate size (hint: use getResultLen).
+    pub fn getResultPreAllocated(
+        self: *Result,
+        out: []u8,
+    ) void {
+        var cur: usize = 0;
+
+        for (0.., self.results.items) |idx, result| {
+            @memcpy(out[cur..][0..result.len], result);
+            cur += result.len;
+
+            if (idx != self.results.items.len - 1) {
+                for (result_join_delimiter) |delimiter_char| {
                     out[cur] = delimiter_char;
                     cur += 1;
                 }
             }
         }
-
-        return out;
     }
 
-    /// Gets the result length, used for ensuring we have properly sized buffers when passing a
-    /// result out of zig into the ffi layer.
-    pub fn getResultLen(
+    /// Total size of all inputs packed back-to-back (no delimiters) -- used for sizing the ffi
+    /// layer's packed input buffer.
+    pub fn getInputsPackedLen(
         self: *Result,
-        options: GetResultOptions,
     ) usize {
-        return getJoinedLen(self.results.items, options);
+        var out_size: usize = 0;
+
+        for (self.inputs.items) |input| {
+            out_size += input.len;
+        }
+
+        return out_size;
     }
 
-    /// Returns all results joined on options.delim string, caller owns joined string.
-    pub fn getResult(
+    /// Total size of all raw journals packed back-to-back (no delimiters) -- used for sizing the
+    /// ffi layer's packed raw journal buffer. Note this is the *journal* size, not the size of
+    /// any reconstructed raw -- the ffi caller reconstructs raw on demand.
+    pub fn getResultsRawJournalPackedLen(
         self: *Result,
-        allocator: std.mem.Allocator,
-        options: GetResultOptions,
-    ) ![]const u8 {
-        const out = try allocator.alloc(
-            u8,
-            self.getResultLen(
-                options,
-            ),
-        );
+    ) usize {
+        var out_size: usize = 0;
 
-        try self.getResultPreAllocated(
-            out,
-            options,
-        );
+        for (self.results_raw_journal.items) |result_raw_journal| {
+            out_size += result_raw_journal.len;
+        }
 
-        return out;
+        return out_size;
     }
 
-    /// Returns all results joined on options.delim string, but expects user to have already
-    /// allocated buf to the appropriate size (hint: use getResultLen w/ the same options).
-    pub fn getResultPreAllocated(
+    /// Total size of all results packed back-to-back (no delimiters) -- used for sizing the ffi
+    /// layer's packed result buffer.
+    pub fn getResultsPackedLen(
+        self: *Result,
+    ) usize {
+        var out_size: usize = 0;
+
+        for (self.results.items) |result| {
+            out_size += result.len;
+        }
+
+        return out_size;
+    }
+
+    /// Packs all inputs back-to-back into out (sized via getInputsPackedLen), recording each
+    /// entry's length into lens (sized to the result count) so the caller can slice the packed
+    /// buffer back apart.
+    pub fn packInputs(
         self: *Result,
         out: []u8,
-        options: GetResultOptions,
-    ) !void {
-        if (out.len == 0) return;
-
+        lens: []u64,
+    ) void {
         var cur: usize = 0;
-        var pending_ws: usize = 0;
 
-        for (0.., self.results.items) |idx, result| {
-            const render_result = if (options.normalize_trailing_whitespace)
-                std.mem.trim(u8, result, "\t\n\r")
-            else
-                result;
+        for (0.., self.inputs.items) |idx, input| {
+            // bounded + alias-tolerant: out/lens are caller (Go/Python) owned ffi buffers sized
+            // by a separate sizes call, so never let a mismatch abort via @memcpy/index panic.
+            bytes.ffiCopyAt(out, cur, input);
+            cur += input.len;
 
-            for (render_result) |ch| {
-                if (options.normalize_line_feeds and ch == '\r') continue;
-
-                // every write into `out` is bounds-guarded: `out` may be a caller-owned (Go /
-                // Python) ffi buffer whose size came from a separate sizes call, so a disagreement
-                // must truncate rather than abort the host process with an out-of-bounds panic.
-                if (options.normalize_trailing_whitespace) {
-                    if (ch == '\n') {
-                        pending_ws = 0;
-
-                        if (cur < out.len) out[cur] = ch;
-                        cur += 1;
-                    } else if (ch == ' ' or ch == '\t') {
-                        pending_ws += 1;
-                    } else {
-                        var i: usize = 0;
-                        while (i < pending_ws) : (i += 1) {
-                            if (cur < out.len) out[cur] = ' ';
-                            cur += 1;
-                        }
-                        pending_ws = 0;
-
-                        if (cur < out.len) out[cur] = ch;
-                        cur += 1;
-                    }
-                } else {
-                    if (cur < out.len) out[cur] = ch;
-                    cur += 1;
-                }
-            }
-
-            if (idx != self.results.items.len - 1) {
-                if (options.normalize_trailing_whitespace) {
-                    pending_ws = 0;
-                }
-
-                for (options.delimiter) |delimiter_char| {
-                    if (cur < out.len) out[cur] = delimiter_char;
-                    cur += 1;
-                }
-            }
+            if (idx < lens.len) lens[idx] = @intCast(input.len);
         }
     }
 
-    /// Returns all raw results joined on options.delim string, but expects user to have already
-    /// allocated buf to the appropriate size (hint: use getResultRawLen w/ the same options).
-    pub fn getResultRawPreAllocated(
+    /// Packs all raw journals back-to-back into out (sized via getResultsRawJournalPackedLen),
+    /// recording each entry's length into lens (sized to the result count) so the caller can
+    /// slice the packed buffer back apart.
+    pub fn packResultsRawJournal(
         self: *Result,
         out: []u8,
-        options: GetResultOptions,
-    ) !void {
+        lens: []u64,
+    ) void {
         var cur: usize = 0;
 
-        for (0.., self.results_raw.items) |idx, result_raw| {
-            // bounded + alias-tolerant: out may be a caller-owned ffi buffer sized by a separate
-            // sizes call, so a mismatch must truncate rather than abort the host via @memcpy.
-            bytes.ffiCopyAt(out, cur, result_raw);
-            cur += result_raw.len;
+        for (0.., self.results_raw_journal.items) |idx, result_raw_journal| {
+            // bounded + alias-tolerant: out/lens are caller (Go/Python) owned ffi buffers sized
+            // by a separate sizes call, so never let a mismatch abort via @memcpy/index panic.
+            bytes.ffiCopyAt(out, cur, result_raw_journal);
+            cur += result_raw_journal.len;
 
-            if (idx != self.results_raw.items.len - 1) {
-                for (options.delimiter) |delimiter_char| {
-                    if (cur < out.len) out[cur] = delimiter_char;
-                    cur += 1;
-                }
-            }
+            if (idx < lens.len) lens[idx] = @intCast(result_raw_journal.len);
+        }
+    }
+
+    /// Packs all results back-to-back into out (sized via getResultsPackedLen), recording each
+    /// entry's length into lens (sized to the result count) so the caller can slice the packed
+    /// buffer back apart.
+    pub fn packResults(
+        self: *Result,
+        out: []u8,
+        lens: []u64,
+    ) void {
+        var cur: usize = 0;
+
+        for (0.., self.results.items) |idx, result| {
+            // bounded + alias-tolerant: out/lens are caller (Go/Python) owned ffi buffers sized
+            // by a separate sizes call, so never let a mismatch abort via @memcpy/index panic.
+            bytes.ffiCopyAt(out, cur, result);
+            cur += result.len;
+
+            if (idx < lens.len) lens[idx] = @intCast(result.len);
         }
     }
 };
 
-fn getJoinedLen(
-    items: []const []const u8,
-    options: GetResultOptions,
-) usize {
-    var len: usize = 0;
+test "getResult and getResultRaw join on newlines" {
+    var res = try Result.init(
+        std.testing.allocator,
+        std.testing.io,
+        "localhost",
+        22,
+        operation.Kind.send_input,
+        null,
+    );
+    defer res.deinit();
 
-    var line_start: usize = 0;
-    var pending_ws: usize = 0;
-
-    for (0.., items) |idx, result| {
-        const render_result = if (options.normalize_trailing_whitespace)
-            std.mem.trim(u8, result, "\t\n\r")
-        else
-            result;
-
-        for (render_result) |ch| {
-            if (options.normalize_line_feeds and ch == '\r') continue;
-
-            if (options.normalize_trailing_whitespace) {
-                if (ch == '\n') {
-                    pending_ws = 0;
-                    len += 1;
-                    line_start = len;
-                } else if (ch == ' ' or ch == '\t') {
-                    pending_ws += 1;
-                } else {
-                    len += pending_ws;
-                    pending_ws = 0;
-                    len += 1;
-                }
-            } else {
-                len += 1;
-            }
-        }
-
-        if (idx != items.len - 1) {
-            if (options.normalize_trailing_whitespace) {
-                pending_ws = 0;
-            }
-
-            len += options.delimiter.len;
-
-            line_start = len;
-            pending_ws = 0;
-        }
-    }
-
-    return len;
-}
-
-test "getJoinedLen" {
-    const cases = [_]struct {
-        items: []const []const u8,
-        options: GetResultOptions,
-        expected: usize,
-    }{
+    // empty journals -> raw == result for each entry
+    try res.record(
         .{
-            // nothing to change
-            .items = &.{ "foo", "bar" },
-            .options = .{},
-            .expected = 7,
+            .rets = [2][]const u8{
+                try std.testing.allocator.dupe(u8, ""),
+                try std.testing.allocator.dupe(u8, "foo"),
+            },
         },
-        .{
-            // trailing whitespace
-            .items = &.{ "foo ", "bar" },
-            .options = .{},
-            .expected = 7,
-        },
-        .{
-            // crlf
-            .items = &.{ "foo\x0D\x0A", "bar" },
-            .options = .{},
-            .expected = 7,
-        },
-        .{
-            // crlf
-            .items = &.{"\x0D\x0Afoo"},
-            .options = .{},
-            .expected = 3,
-        },
-        .{
-            // trailing space
-            .items = &.{"foo "},
-            .options = .{},
-            .expected = 3,
-        },
-    };
+    );
 
-    for (cases) |case| {
-        const actual = getJoinedLen(case.items, case.options);
+    try res.record(
+        .{
+            .rets = [2][]const u8{
+                try std.testing.allocator.dupe(u8, ""),
+                try std.testing.allocator.dupe(u8, "bar"),
+            },
+        },
+    );
 
-        try std.testing.expectEqual(case.expected, actual);
-    }
+    const actual = try res.getResult(std.testing.allocator);
+    defer std.testing.allocator.free(actual);
+
+    try std.testing.expectEqualStrings("foo\nbar", actual);
+
+    const actual_raw = try res.getResultRaw(std.testing.allocator);
+    defer std.testing.allocator.free(actual_raw);
+
+    try std.testing.expectEqualStrings("foo\nbar", actual_raw);
 }

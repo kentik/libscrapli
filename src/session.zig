@@ -4,14 +4,27 @@ const ascii = @import("ascii.zig");
 const auth = @import("auth.zig");
 const bytes = @import("bytes.zig");
 const bytes_check = @import("bytes-check.zig");
+const cancellation = @import("cancellation.zig");
 const errors = @import("errors.zig");
 const logging = @import("logging.zig");
 const operation = @import("cli-operation.zig");
 const queue = @import("queue.zig");
 const re = @import("re.zig");
 const transport = @import("transport.zig");
+const transport_test = @import("transport-test.zig");
 
 const default_return_char: []const u8 = "\n";
+
+// default initial reserve for the per-session scratch buffers (~8x the default read size);
+// in theory this should be large enough to hold lots of outputs from devices like show version
+// or even show run from a not super wildly huge device (a simple 8 port 3560 w/ some generic
+// config is ~7k chars, so... not going to hold a massive core router or stack config but its also
+// big enough to be a good baseline).
+const default_scratch_initial_size: u64 = 32_768;
+// max space to retain in the scratch -- we dont want this to be too high because this is like a
+// bare min floor our memory utilization will be at even if there is literally nothign happening,
+// so... twice the default size seems ok.
+const default_scratch_retain_max: u64 = 2 * default_scratch_initial_size;
 
 const ReadThreadState = enum(u8) {
     uninitialized,
@@ -24,6 +37,10 @@ pub const RecordDestination = union(enum) {
     writer: std.Io.File.Writer,
     f: []const u8,
     cb: *const fn (buf: *const []u8) callconv(.c) void,
+    ffi: struct {
+        user_data: usize,
+        cb: *const fn (user_data: usize, buf: *const []u8) callconv(.c) void,
+    },
 };
 
 const Recorder = struct {
@@ -31,35 +48,33 @@ const Recorder = struct {
     recorder: ?std.Io.File.Writer,
 
     fn init(io: std.Io, rd: ?RecordDestination, buf: []u8) !Recorder {
-        if (rd == null) {
-            return Recorder{
-                .rd = rd,
-                .recorder = null,
-            };
-        }
+        const destination = rd orelse return Recorder{
+            .rd = null,
+            .recorder = null,
+        };
 
-        switch (rd.?) {
-            .f => {
+        switch (destination) {
+            .f => |path| {
                 const out_f = try std.Io.Dir.cwd().createFile(
                     io,
-                    rd.?.f,
+                    path,
                     .{},
                 );
 
                 return Recorder{
-                    .rd = rd,
+                    .rd = destination,
                     .recorder = out_f.writer(io, buf),
                 };
             },
-            .writer => {
+            .writer => |writer| {
                 return Recorder{
-                    .rd = rd,
-                    .recorder = rd.?.writer,
+                    .rd = destination,
+                    .recorder = writer,
                 };
             },
-            .cb => {
+            .cb, .ffi => {
                 return Recorder{
-                    .rd = rd,
+                    .rd = destination,
                     .recorder = null,
                 };
             },
@@ -74,8 +89,10 @@ const Recorder = struct {
                 .f => {
                     // when just given a file path we'll "own" that lifecycle and close/cleanup
                     // as well as ensure we strip asci/ansi bits (so the file is easy to read etc.
-                    // and especially for tests!); otherwise we'll leave it to the user
-                    try self.recorder.?.interface.flush();
+                    // and especially for tests!); otherwise we'll leave it to the user. we'll
+                    // do this best effort to not have dangling file handles and to not cause chaos
+                    // for scrapli generally just based on the recorder having a bad time
+                    self.recorder.?.interface.flush() catch {};
                     self.recorder.?.file.close(io);
                     self.recorder = null;
 
@@ -97,25 +114,16 @@ const Recorder = struct {
                 .cb => {
                     rd.cb(&buf);
                 },
+                .ffi => |f| {
+                    f.cb(f.user_data, &buf);
+                },
             }
         }
     }
 };
 
-/// Holds option inputs for the session.
-pub const OptionsInputs = struct {
-    read_size: u64 = 4_096,
-    read_min_delay_ns: u64 = 5_000,
-    read_max_delay_ns: u64 = 15_000_000,
-    return_char: []const u8 = default_return_char,
-    operation_timeout_ns: u64 = 10_000_000_000,
-    operation_max_search_depth: u64 = 512,
-    record_destination: ?RecordDestination = null,
-};
-
 /// Holds session options.
 pub const Options = struct {
-    allocator: std.mem.Allocator,
     read_size: u64 = 4_096,
     read_min_delay_ns: u64 = 5_000,
     read_max_delay_ns: u64 = 15_000_000,
@@ -123,58 +131,62 @@ pub const Options = struct {
     operation_timeout_ns: u64 = 10_000_000_000,
     operation_max_search_depth: u64 = 512,
     record_destination: ?RecordDestination = null,
+    scratch_initial_size: u64 = default_scratch_initial_size,
+    // scratch capacity is shrunk back to this many bytes when an operation leaves it larger,
+    // so a single huge operation does not pin memory for the life of the session. should
+    // generally be >= scratch_initial_size.
+    scratch_retain_max: u64 = default_scratch_retain_max,
 
-    /// Initializes the session options. Heap allocating fields we need to live as long as the
-    /// session object so we always have those available.
-    pub fn init(allocator: std.mem.Allocator, opts: OptionsInputs) !*Options {
-        const o = try allocator.create(Options);
-        errdefer allocator.destroy(o);
+    normalize_line_feeds: bool = true,
+    normalize_trailing_whitespace: bool = true,
 
-        o.* = Options{
-            .allocator = allocator,
-            .read_size = opts.read_size,
-            .read_min_delay_ns = opts.read_min_delay_ns,
-            .read_max_delay_ns = opts.read_max_delay_ns,
-            .return_char = opts.return_char,
-            .operation_timeout_ns = opts.operation_timeout_ns,
-            .operation_max_search_depth = opts.operation_max_search_depth,
-            .record_destination = opts.record_destination,
-        };
+    fn init(
+        allocator: std.mem.Allocator,
+        opts: Options,
+    ) !Options {
+        var o = opts;
 
-        if (&o.return_char[0] != &default_return_char[0]) {
-            o.return_char = try o.allocator.dupe(u8, o.return_char);
+        // reset the owned pointer fields so the owned copy only ever holds pointers this init
+        // actually duped -- that way a failure partway through only frees memory we own, never
+        // the caller's
+        o.return_char = default_return_char;
+        o.record_destination = null;
+
+        errdefer o.deinit(allocator);
+
+        if (opts.return_char.ptr != default_return_char.ptr) {
+            o.return_char = try allocator.dupe(u8, opts.return_char);
         }
 
-        if (o.record_destination) |rd| {
+        if (opts.record_destination) |rd| {
             switch (rd) {
                 .f => {
                     o.record_destination = RecordDestination{
-                        .f = try o.allocator.dupe(u8, rd.f),
+                        .f = try allocator.dupe(u8, rd.f),
                     };
                 },
-                else => {},
+                else => {
+                    o.record_destination = rd;
+                },
             }
         }
 
         return o;
     }
 
-    /// Deinitializes the session options.
-    pub fn deinit(self: *Options) void {
-        if (&self.return_char[0] != &default_return_char[0]) {
-            self.allocator.free(self.return_char);
+    fn deinit(self: Options, allocator: std.mem.Allocator) void {
+        if (self.return_char.ptr != default_return_char.ptr) {
+            allocator.free(self.return_char);
         }
 
         if (self.record_destination) |rd| {
             switch (rd) {
                 .f => {
-                    self.allocator.free(rd.f);
+                    allocator.free(rd.f);
                 },
                 else => {},
             }
         }
-
-        self.allocator.destroy(self);
     }
 };
 
@@ -187,29 +199,31 @@ pub const Session = struct {
     io: std.Io,
 
     log: logging.Logger,
-    options: *Options,
-    auth_options: *auth.Options,
+    options: Options,
+    auth_options: auth.Options,
 
-    transport: *transport.Transport,
+    transport: transport.Transport,
 
-    read_thread: ?std.Thread,
-    read_stop: std.atomic.Value(ReadThreadState),
+    read_thread: ?std.Thread = null,
+    read_stop: std.atomic.Value(ReadThreadState) = std.atomic.Value(ReadThreadState).init(
+        ReadThreadState.uninitialized,
+    ),
     // signals in-flight cooperative reads (see readTimeout) that the session is being torn down so
     // they stop looping and return promptly, even when the operation timeout is disabled (0) and
     // the caller relies solely on cooperative cancellation that may never arrive.
-    close_requested: std.atomic.Value(bool),
-    read_lock: std.Io.Mutex,
-    read_queue: queue.LinearFifo(
-        u8,
-        .dynamic,
-    ),
-    read_thread_errored: std.atomic.Value(bool),
+    close_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    read_lock: std.Io.Mutex = .init,
+    read_queue: queue.LinearFifo(u8),
+    read_thread_errored: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     read_thread_error: ?anyerror = null,
-    read_into_buf: ?[]u8 = null,
-    read_loop_buf: ?[]u8 = null,
+    read_into_buf: []u8,
+    read_loop_buf: []u8,
 
-    recorder_buf: [1024]u8 = [_]u8{0} ** 1024,
-    recorder: Recorder,
+    recorder_buf: [1024]u8 = @splat(0),
+    recorder: Recorder = .{
+        .rd = null,
+        .recorder = null,
+    },
 
     compiled_username_pattern: ?*re.pcre2CompiledPattern = null,
     compiled_password_pattern: ?*re.pcre2CompiledPattern = null,
@@ -217,8 +231,15 @@ pub const Session = struct {
 
     prompt_pattern: []const u8,
     compiled_prompt_pattern: ?*re.pcre2CompiledPattern = null,
+    prompt_excludes: ?[]const []const u8 = null,
 
-    last_consumed_prompt: std.ArrayList(u8),
+    last_consumed_prompt: std.ArrayList(u8) = .empty,
+
+    last_error: errors.LastError = .{},
+
+    // reusable scratch buffers for building operation output; owned by the session and reset
+    // at the start of each op so we dont reallocate every time
+    scratch: bytes.ProcessedBuf,
 
     /// Initializes the session object.
     pub fn init(
@@ -226,91 +247,90 @@ pub const Session = struct {
         io: std.Io,
         log: logging.Logger,
         prompt_pattern: []const u8,
-        options: *Options,
-        auth_options: *auth.Options,
-        transport_options: *transport.Options,
-    ) !*Session {
+        prompt_excludes: ?[]const []const u8,
+        options: Options,
+        auth_options: auth.Options,
+        transport_options: transport.Options,
+    ) !Session {
         logging.traceWithSrc(log, @src(), "session.Session init requested", .{});
 
-        const t = try transport.Transport.init(
-            allocator,
-            io,
-            log,
-            transport_options,
-        );
-        errdefer t.deinit();
+        var s = init_session: {
+            var owned_options = try Options.init(allocator, options);
+            errdefer owned_options.deinit(allocator);
 
-        const s = try allocator.create(Session);
+            var owned_auth_options = try auth.Options.init(allocator, auth_options);
+            errdefer owned_auth_options.deinit(allocator);
 
-        s.* = Session{
-            .allocator = allocator,
-            .io = io,
-            .log = log,
-            .options = options,
-            .auth_options = auth_options,
-            .transport = t,
-            .read_thread = null,
-            .read_stop = std.atomic.Value(ReadThreadState).init(ReadThreadState.uninitialized),
-            .close_requested = std.atomic.Value(bool).init(false),
-            .read_lock = std.Io.Mutex.init,
-            .read_queue = queue.LinearFifo(
-                u8,
-                .dynamic,
-            ).init(allocator),
-            .read_thread_errored = std.atomic.Value(bool).init(false),
-            .read_into_buf = try allocator.alloc(u8, options.read_size),
-            .read_loop_buf = try allocator.alloc(u8, options.read_size),
-            .recorder = try Recorder.init(io, options.record_destination, &s.recorder_buf),
-            .prompt_pattern = prompt_pattern,
-            .last_consumed_prompt = .empty,
+            var owned_transport = try transport.Transport.init(
+                allocator,
+                io,
+                log,
+                transport_options,
+            );
+            errdefer owned_transport.deinit();
+
+            break :init_session Session{
+                .allocator = allocator,
+                .io = io,
+                .log = log,
+                .options = owned_options,
+                .auth_options = owned_auth_options,
+                .transport = owned_transport,
+                .read_queue = queue.LinearFifo(u8).init(allocator),
+                .read_into_buf = &[_]u8{},
+                .read_loop_buf = &[_]u8{},
+                .prompt_pattern = prompt_pattern,
+                .prompt_excludes = prompt_excludes,
+                .scratch = .{
+                    .normalize_line_feeds = owned_options.normalize_line_feeds,
+                    .normalize_trailing_whitespace = owned_options.normalize_trailing_whitespace,
+                },
+            };
         };
         errdefer s.deinit();
 
-        s.compiled_username_pattern = re.pcre2Compile(s.auth_options.username_pattern);
-        if (s.compiled_username_pattern == null) {
+        s.read_into_buf = try allocator.alloc(u8, s.options.read_size);
+        s.read_loop_buf = try allocator.alloc(u8, s.options.read_size);
+
+        try s.scratch.reserve(allocator, s.options.scratch_initial_size);
+
+        s.compiled_username_pattern = re.pcre2Compile(s.auth_options.username_pattern) orelse
             return errors.wrapCriticalError(
                 errors.ScrapliError.Driver,
                 @src(),
                 log,
-                "session.Session init: failed compling username pattern {s}",
+                "session.Session init: failed compiling username pattern {s}",
                 .{s.auth_options.username_pattern},
             );
-        }
 
-        s.compiled_password_pattern = re.pcre2Compile(s.auth_options.password_pattern);
-        if (s.compiled_password_pattern == null) {
+        s.compiled_password_pattern = re.pcre2Compile(s.auth_options.password_pattern) orelse
             return errors.wrapCriticalError(
                 errors.ScrapliError.Driver,
                 @src(),
                 log,
-                "session.Session init: failed compling password pattern {s}",
+                "session.Session init: failed compiling password pattern {s}",
                 .{s.auth_options.password_pattern},
             );
-        }
 
         s.compiled_private_key_passphrase_pattern = re.pcre2Compile(
             s.auth_options.private_key_passphrase_pattern,
-        );
-        if (s.compiled_private_key_passphrase_pattern == null) {
+        ) orelse
             return errors.wrapCriticalError(
                 errors.ScrapliError.Driver,
                 @src(),
                 log,
-                "session.Session init: failed compling passphrase pattern {s}",
+                "session.Session init: failed compiling passphrase pattern {s}",
                 .{s.auth_options.private_key_passphrase_pattern},
             );
-        }
 
-        s.compiled_prompt_pattern = re.pcre2Compile(s.prompt_pattern);
-        if (s.compiled_prompt_pattern == null) {
+        s.compiled_prompt_pattern = re.pcre2Compile(s.prompt_pattern) orelse
             return errors.wrapCriticalError(
                 errors.ScrapliError.Driver,
                 @src(),
                 log,
-                "session.Session init: failed compling prompt pattern {s}",
+                "session.Session init: failed compiling prompt pattern {s}",
                 .{s.prompt_pattern},
             );
-        }
 
         return s;
     }
@@ -332,34 +352,30 @@ pub const Session = struct {
 
         self.last_consumed_prompt.deinit(self.allocator);
 
-        if (self.read_into_buf) |b| {
-            self.allocator.free(b);
+        self.allocator.free(self.read_into_buf);
+        self.allocator.free(self.read_loop_buf);
+
+        if (self.compiled_username_pattern) |compiled_pattern| {
+            re.pcre2Free(compiled_pattern);
         }
 
-        if (self.read_loop_buf) |b| {
-            self.allocator.free(b);
+        if (self.compiled_password_pattern) |compiled_pattern| {
+            re.pcre2Free(compiled_pattern);
         }
 
-        if (self.compiled_username_pattern != null) {
-            re.pcre2Free(self.compiled_username_pattern.?);
+        if (self.compiled_private_key_passphrase_pattern) |compiled_pattern| {
+            re.pcre2Free(compiled_pattern);
         }
 
-        if (self.compiled_password_pattern != null) {
-            re.pcre2Free(self.compiled_password_pattern.?);
+        if (self.compiled_prompt_pattern) |compiled_pattern| {
+            re.pcre2Free(compiled_pattern);
         }
 
-        if (self.compiled_private_key_passphrase_pattern != null) {
-            re.pcre2Free(self.compiled_private_key_passphrase_pattern.?);
-        }
-
-        if (self.compiled_prompt_pattern != null) {
-            re.pcre2Free(self.compiled_prompt_pattern.?);
-        }
-
+        self.auth_options.deinit(self.allocator);
+        self.options.deinit(self.allocator);
         self.transport.deinit();
         self.read_queue.deinit();
-
-        self.allocator.destroy(self);
+        self.scratch.deinit(self.allocator);
     }
 
     /// Opens the session object, starting the background read thread, and ensuring the underlying
@@ -373,9 +389,21 @@ pub const Session = struct {
     ) ![2][]const u8 {
         self.log.info("session.Session open requested", .{});
 
+        if (self.read_thread != null) {
+            self.log.critical("session.Session open requested but session already opened", .{});
+
+            return errors.ScrapliError.Session;
+        }
+
+        self.recorder = try Recorder.init(
+            self.io,
+            self.options.record_destination,
+            &self.recorder_buf,
+        );
+
         // clear any stale close-requested signal from a previous session lifecycle so a freshly
         // opened session starts clean.
-        self.close_requested.store(false, std.builtin.AtomicOrder.release);
+        self.close_requested.store(false, std.lang.AtomicOrder.release);
 
         const start_time = std.Io.Timestamp.now(self.io, .awake);
 
@@ -388,18 +416,22 @@ pub const Session = struct {
             self.auth_options,
         );
 
-        self.read_stop.store(ReadThreadState.run, std.builtin.AtomicOrder.unordered);
+        self.read_stop.store(ReadThreadState.run, std.lang.AtomicOrder.unordered);
 
         self.read_thread = std.Thread.spawn(
             .{},
             Session.readLoop,
             .{self},
         ) catch |err| {
+            const last_error = "session.Session open: failed spawning read thread";
+
+            self.last_error.set(last_error);
+
             return errors.wrapCriticalError(
                 err,
                 @src(),
                 self.log,
-                "session.Session open: failed spawning read thread",
+                last_error,
                 .{},
             );
         };
@@ -428,7 +460,7 @@ pub const Session = struct {
     /// block teardown/join indefinitely when the operation timeout is disabled (0) and the caller
     /// relies solely on cooperative cancellation that may never arrive.
     pub fn signalCloseRequested(self: *Session) void {
-        self.close_requested.store(true, std.builtin.AtomicOrder.release);
+        self.close_requested.store(true, std.lang.AtomicOrder.release);
     }
 
     /// Closes the session, stopping the read thread, unblocking any in flight reads of the
@@ -440,38 +472,54 @@ pub const Session = struct {
         // an operation timeout (which may be disabled) or cancellation (which may never arrive).
         self.signalCloseRequested();
 
-        if (self.read_stop.load(std.builtin.AtomicOrder.acquire) != ReadThreadState.run) {
-            return;
-        }
+        self.read_stop.store(ReadThreadState.stop, std.lang.AtomicOrder.unordered);
 
-        self.read_stop.store(ReadThreadState.stop, std.builtin.AtomicOrder.unordered);
+        var prepare_close_err: ?anyerror = null;
 
         // need to unblock the transport waiter after signaling the read thread to stop, this will
         // stop the waiter (which happens in transport.read), then the readloop can nicely exit
-        try self.transport.prepareClose();
+        self.transport.prepareClose() catch |err| {
+            prepare_close_err = err;
+        };
 
         if (self.read_thread) |t| {
             t.join();
             self.read_thread = null;
         }
 
-        try self.recorder.close(self.io);
+        self.recorder.close(self.io) catch |err| {
+            self.log.warn(
+                "session.Session close recorder close failed, error '{any}', ignoring...",
+                .{err},
+            );
+        };
 
         self.transport.close();
+
+        if (prepare_close_err) |err| {
+            return err;
+        }
     }
 
-    fn readLoop(self: *Session) !void {
+    fn readLoop(self: *Session) void {
+        self.readLoopInner() catch |err| {
+            self.read_thread_error = err;
+            self.read_thread_errored.store(true, std.lang.AtomicOrder.release);
+        };
+    }
+
+    fn readLoopInner(self: *Session) !void {
         self.log.info("session.Session read thread started", .{});
 
-        const buf = self.read_loop_buf.?;
+        const buf = self.read_loop_buf;
 
-        while (self.read_stop.load(std.builtin.AtomicOrder.acquire) != ReadThreadState.stop) {
-            const n = self.transport.read(buf) catch |err| {
-                self.read_thread_error = err;
-                self.read_thread_errored.store(true, std.builtin.AtomicOrder.release);
+        while (self.read_stop.load(std.lang.AtomicOrder.acquire) == ReadThreadState.run) {
+            const n = try self.transport.read(buf);
 
+            if (self.read_stop.load(std.lang.AtomicOrder.acquire) != ReadThreadState.run) {
+                // read was interrupted
                 return;
-            };
+            }
 
             if (n == 0) {
                 continue;
@@ -500,10 +548,9 @@ pub const Session = struct {
 
     /// Reads from the internal queue into the given buffer.
     pub fn read(self: *Session, buf: []u8) !usize {
-        try self.read_lock.lock(self.io);
-        defer self.read_lock.unlock(self.io);
-
-        if (self.read_thread_errored.load(std.builtin.AtomicOrder.acquire) and
+        // the readableLength peek below is outside of the lock, it cant be concurrently accessed
+        // rn, but... in the future if something changes it potentially could so just heads up
+        if (self.read_thread_errored.load(std.lang.AtomicOrder.acquire) and
             self.read_queue.readableLength() == 0)
         {
             // once the read thread is errored out and there is nothing else to
@@ -514,6 +561,9 @@ pub const Session = struct {
 
             return errors.ScrapliError.EOF;
         }
+
+        try self.read_lock.lock(self.io);
+        defer self.read_lock.unlock(self.io);
 
         return self.read_queue.read(buf);
     }
@@ -560,8 +610,8 @@ pub const Session = struct {
 
         var cur_read_delay_ns: u64 = self.options.read_min_delay_ns;
 
-        var bufs = bytes.ProcessedBuf.init(allocator);
-        defer bufs.deinit();
+        const bufs = &self.scratch;
+        try bufs.reset(self.allocator, self.options.scratch_retain_max);
 
         var cur_check_start_idx: usize = 0;
 
@@ -569,25 +619,29 @@ pub const Session = struct {
         var auth_password_prompt_seen_count: u8 = 0;
         var auth_passphrase_prompt_seen_count: u8 = 0;
 
-        const buf = self.read_into_buf orelse return errors.ScrapliError.Session;
+        const buf = self.read_into_buf;
 
-        // need to unblock the transport waiter after signaling the read thread to stop, this will
-        // stop the waiter (which happens in transport.read), then the readloop can nicely exit;
-        // we only need to do this here in addition to close because we
-        // zlinter-disable-next-line no_swallow_error - best effort
-        errdefer self.transport.prepareClose() catch {};
-
-        // in the case of auth, if we error out, we almost certainly need to stop the read loop
-        // as the transport is probably gone from under our feet anyway.
-        errdefer self.read_stop.store(ReadThreadState.stop, std.builtin.AtomicOrder.unordered);
+        errdefer {
+            // need to unblock the transport waiter after signaling the read thread to stop, this
+            // will stop the waiter (which happens in transport.read), then the readloop can nicely
+            // exit; users should always be defering/calling deinit anyway but... this feels like
+            // a nice extra layer of sanity
+            self.read_stop.store(ReadThreadState.stop, std.lang.AtomicOrder.unordered);
+            // zlinter-disable-next-line no_swallow_error - best effort
+            self.transport.prepareClose() catch {};
+        }
 
         while (true) {
-            if (cancel != null and cancel.?.*) {
+            if (cancellation.cancelled(cancel)) {
+                const last_error = "session.Session authenticate: operation cancelled";
+
+                self.last_error.set(last_error);
+
                 return errors.wrapCriticalError(
                     errors.ScrapliError.Cancelled,
                     @src(),
                     self.log,
-                    "session.Session authenticate: operation cancelled",
+                    last_error,
                     .{},
                 );
             }
@@ -596,6 +650,8 @@ pub const Session = struct {
                 const ns_since_start = start_timestamp.untilNow(self.io, .awake).nanoseconds;
 
                 if (ns_since_start > self.options.operation_timeout_ns) {
+                    self.last_error.set("session.Session authenticate: operation timeout exceeded");
+
                     return errors.wrapCriticalError(
                         errors.ScrapliError.TimeoutExceeded,
                         @src(),
@@ -616,12 +672,15 @@ pub const Session = struct {
                         // hitting eof in auth/open means we likely got a connection refused or
                         // something similar. we gotta slurp up the buffer to read it and check so
                         // we can *hopefully* return a decent error message to the user
-                        const error_message = try auth.openMessageHandler(
-                            allocator,
-                            bufs.processed.items,
-                        );
+                        const error_message = try auth.openMessageHandler(bufs.processed.items);
 
                         if (error_message) |msg| {
+                            self.last_error.setFmt(
+                                "session.Session authenticate: open failed, error: '{s}'",
+                                .{msg},
+                                "session.Session authenticate: open failed, EOF",
+                            );
+
                             return errors.wrapCriticalError(
                                 errors.ScrapliError.Transport,
                                 @src(),
@@ -630,6 +689,8 @@ pub const Session = struct {
                                 .{msg},
                             );
                         }
+
+                        self.last_error.set("session.Session authenticate: open failed");
 
                         return errors.wrapCriticalError(
                             errors.ScrapliError.Transport,
@@ -646,12 +707,11 @@ pub const Session = struct {
             };
 
             if (n == 0) {
-                std.Io.Clock.Duration.sleep(
+                self.io.sleep(
                     .{
-                        .clock = .awake,
-                        .raw = .fromNanoseconds(cur_read_delay_ns),
+                        .nanoseconds = cur_read_delay_ns,
                     },
-                    self.io,
+                    .awake,
                 ) catch |err| {
                     self.log.warn(
                         "session.Session authenticate: sleep error '{}', ignoring",
@@ -669,19 +729,22 @@ pub const Session = struct {
                 cur_read_delay_ns = self.options.read_min_delay_ns;
             }
 
-            try bufs.appendSlice(buf[0..n]);
+            try bufs.appendWithProcessing(self.allocator, buf[0..n]);
 
             const searchable_buf = bytes.getBufSearchView(
                 bufs.processed.items[cur_check_start_idx..],
                 self.options.operation_max_search_depth,
             );
 
-            const error_message = try auth.openMessageHandler(
-                allocator,
-                bufs.processed.items,
-            );
+            const error_message = try auth.openMessageHandler(bufs.processed.items);
 
             if (error_message) |msg| {
+                self.last_error.setFmt(
+                    "session.Session authenticate: open failed, error: '{s}'",
+                    .{msg},
+                    "session.Session authenticate: error in stdout",
+                );
+
                 return errors.wrapCriticalError(
                     errors.ScrapliError.Session,
                     @src(),
@@ -701,126 +764,161 @@ pub const Session = struct {
 
             switch (state) {
                 .complete => {
-                    return bufs.toOwnedSlices();
+                    return bufs.dupeOwnedSlices(allocator);
                 },
                 .username_prompted => {
-                    if (self.auth_options.username == null) {
+                    if (self.auth_options.username) |un| {
+                        auth_username_prompt_seen_count += 1;
+
+                        if (auth_username_prompt_seen_count > 2) {
+                            const last_error = "session.Session authenticate: username prompt " ++
+                                "seen multiple times, assuming authentication failed";
+
+                            self.last_error.set(last_error);
+
+                            return errors.wrapCriticalError(
+                                errors.ScrapliError.Session,
+                                @src(),
+                                self.log,
+                                last_error,
+                                .{},
+                            );
+                        }
+
+                        try self.writeAndReturn(un, true);
+
+                        cur_check_start_idx = bufs.processed.items.len;
+
+                        continue;
+                    } else {
+                        const last_error = "session.Session authenticate: username prompt seen " ++
+                            "but no username set";
+
+                        self.last_error.set(last_error);
+
                         return errors.wrapCriticalError(
                             errors.ScrapliError.Session,
                             @src(),
                             self.log,
-                            "session.Session authenticate: username prompt seen " ++
-                                "but no username set",
+                            last_error,
                             .{},
                         );
                     }
-
-                    auth_username_prompt_seen_count += 1;
-
-                    if (auth_username_prompt_seen_count > 2) {
-                        return errors.wrapCriticalError(
-                            errors.ScrapliError.Session,
-                            @src(),
-                            self.log,
-                            "session.Session authenticate: username prompt seen " ++
-                                "multiple times, assuming authentication failed",
-                            .{},
-                        );
-                    }
-
-                    try self.writeAndReturn(self.auth_options.username.?, true);
-
-                    cur_check_start_idx = bufs.processed.items.len;
-
-                    continue;
                 },
                 .password_prompted => {
-                    if (self.auth_options.password == null) {
-                        return errors.wrapCriticalError(
-                            errors.ScrapliError.Session,
-                            @src(),
-                            self.log,
-                            "session.Session authenticate: password prompt seen " ++
-                                "but no password set",
-                            .{},
-                        );
-                    }
+                    if (self.auth_options.password) |pw| {
+                        auth_password_prompt_seen_count += 1;
 
-                    auth_password_prompt_seen_count += 1;
+                        if (auth_password_prompt_seen_count > 2) {
+                            const last_error = "session.Session authenticate: password prompt  " ++
+                                "seen multiple times, assuming authentication failed";
 
-                    if (auth_password_prompt_seen_count > 2) {
-                        return errors.wrapCriticalError(
-                            errors.ScrapliError.Session,
-                            @src(),
-                            self.log,
-                            "session.Session authenticate: password prompt seen multiple times, " ++
-                                "assuming authentication failed",
-                            .{},
-                        );
-                    }
+                            self.last_error.set(last_error);
 
-                    try self.writeAndReturn(
-                        self.auth_options.resolveAuthValue(
-                            self.auth_options.password.?,
-                        ) catch |err| {
                             return errors.wrapCriticalError(
-                                err,
+                                errors.ScrapliError.Session,
                                 @src(),
                                 self.log,
-                                "session.Session authenticate: failed resolving auth " ++
-                                    "lookup value '{s}'",
-                                .{self.auth_options.password.?},
+                                last_error,
+                                .{},
                             );
-                        },
-                        true,
-                    );
+                        }
 
-                    cur_check_start_idx = bufs.processed.items.len;
+                        try self.writeAndReturn(
+                            self.auth_options.resolveAuthValue(
+                                pw,
+                            ) catch |err| {
+                                self.last_error.set(
+                                    "session.Session authenticate: failed resolving auth " ++
+                                        "lookup value",
+                                );
 
-                    continue;
+                                return errors.wrapCriticalError(
+                                    err,
+                                    @src(),
+                                    self.log,
+                                    "session.Session authenticate: failed resolving auth " ++
+                                        "lookup value '{s}'",
+                                    .{pw},
+                                );
+                            },
+                            true,
+                        );
+
+                        cur_check_start_idx = bufs.processed.items.len;
+
+                        continue;
+                    } else {
+                        const last_error = "session.Session authenticate: password prompt seen " ++
+                            "but no password set";
+
+                        self.last_error.set(last_error);
+
+                        return errors.wrapCriticalError(
+                            errors.ScrapliError.Session,
+                            @src(),
+                            self.log,
+                            last_error,
+                            .{},
+                        );
+                    }
                 },
                 .passphrase_prompted => {
-                    if (self.auth_options.private_key_passphrase == null) {
-                        return errors.wrapCriticalError(
-                            errors.ScrapliError.Session,
-                            @src(),
-                            self.log,
-                            "session.Session authenticate: private key passphrase prompt " ++
-                                "seen but no passphrase set",
-                            .{},
-                        );
-                    }
+                    if (self.auth_options.private_key_passphrase) |pk| {
+                        auth_passphrase_prompt_seen_count += 1;
 
-                    auth_passphrase_prompt_seen_count += 1;
+                        if (auth_passphrase_prompt_seen_count > 2) {
+                            const last_error = "session.Session authenticate: private key " ++
+                                "passphrase prompt seen multiple times, assuming authentication " ++
+                                "failed";
 
-                    if (auth_passphrase_prompt_seen_count > 2) {
-                        return errors.wrapCriticalError(
-                            errors.ScrapliError.Session,
-                            @src(),
-                            self.log,
-                            "session.Session authenticate: private key passphrase prompt " ++
-                                "seen multiple times, assuming authentication failed",
-                            .{},
-                        );
-                    }
+                            self.last_error.set(last_error);
 
-                    try self.writeAndReturn(
-                        self.auth_options.resolveAuthValue(
-                            self.auth_options.private_key_passphrase.?,
-                        ) catch |err| {
                             return errors.wrapCriticalError(
-                                err,
+                                errors.ScrapliError.Session,
                                 @src(),
                                 self.log,
-                                "session.Session authenticate: failed resolving auth " ++
-                                    "lookup value '{s}'",
-                                .{self.auth_options.password.?},
+                                last_error,
+                                .{},
                             );
-                        },
-                        true,
-                    );
+                        }
 
-                    cur_check_start_idx = bufs.processed.items.len;
+                        try self.writeAndReturn(
+                            self.auth_options.resolveAuthValue(
+                                pk,
+                            ) catch |err| {
+                                self.last_error.set(
+                                    "session.Session authenticate: failed resolving auth " ++
+                                        "lookup value",
+                                );
+
+                                return errors.wrapCriticalError(
+                                    err,
+                                    @src(),
+                                    self.log,
+                                    "session.Session authenticate: failed resolving auth " ++
+                                        "lookup value '{s}'",
+                                    .{pk},
+                                );
+                            },
+                            true,
+                        );
+
+                        cur_check_start_idx = bufs.processed.items.len;
+                    } else {
+                        const last_error = "session.Session authenticate: private key " ++
+                            "passphrase prompt seen but no passphrase set";
+
+                        self.last_error.set(last_error);
+
+                        return errors.wrapCriticalError(
+                            errors.ScrapliError.Session,
+                            @src(),
+                            self.log,
+                            last_error,
+                            .{},
+                        );
+                    }
                 },
                 ._continue => {},
             }
@@ -832,6 +930,10 @@ pub const Session = struct {
         max_val: u64,
     ) u64 {
         var new_val: u64 = cur_val;
+
+        if (new_val == 0) {
+            new_val = 1;
+        }
 
         new_val *= 2;
         if (new_val > max_val) {
@@ -847,7 +949,7 @@ pub const Session = struct {
         self: *Session,
         start_timestamp: std.Io.Timestamp,
         cancel: ?*bool,
-        checkF: bytes_check.CheckF,
+        check_f: bytes_check.CheckF,
         check_args: bytes_check.CheckArgs,
         bufs: *bytes.ProcessedBuf,
         search_depth: u64,
@@ -865,20 +967,24 @@ pub const Session = struct {
         // increase the found start/end positions by this value too!
         const op_processed_buf_starting_len = bufs.processed.items.len;
 
-        const buf = self.read_into_buf orelse return errors.ScrapliError.Session;
+        const buf = self.read_into_buf;
 
         while (true) {
-            if (cancel != null and cancel.?.*) {
+            if (cancellation.cancelled(cancel)) {
+                const last_error = "session.Session readTimeout: operation cancelled";
+
+                self.last_error.set(last_error);
+
                 return errors.wrapCriticalError(
                     errors.ScrapliError.Cancelled,
                     @src(),
                     self.log,
-                    "session.Session readTimeout: operation cancelled",
+                    last_error,
                     .{},
                 );
             }
 
-            if (self.close_requested.load(std.builtin.AtomicOrder.acquire)) {
+            if (self.close_requested.load(std.lang.AtomicOrder.acquire)) {
                 return errors.wrapCriticalError(
                     errors.ScrapliError.Cancelled,
                     @src(),
@@ -892,6 +998,8 @@ pub const Session = struct {
                 const ns_since_start = start_timestamp.untilNow(self.io, .awake).nanoseconds;
 
                 if (ns_since_start > self.options.operation_timeout_ns) {
+                    self.last_error.set("session.Session readTimeout: operation timeout exceeded");
+
                     return errors.wrapCriticalError(
                         errors.ScrapliError.TimeoutExceeded,
                         @src(),
@@ -909,12 +1017,11 @@ pub const Session = struct {
             const n = try self.read(buf);
 
             if (n == 0) {
-                std.Io.Clock.Duration.sleep(
+                self.io.sleep(
                     .{
-                        .clock = .awake,
-                        .raw = .fromNanoseconds(cur_read_delay_ns),
+                        .nanoseconds = cur_read_delay_ns,
                     },
-                    self.io,
+                    .awake,
                 ) catch |err| {
                     self.log.warn(
                         "session.Session readTimeout: sleep error '{}', ignoring",
@@ -932,8 +1039,7 @@ pub const Session = struct {
                 cur_read_delay_ns = self.options.read_min_delay_ns;
             }
 
-            try bufs.appendSlice(buf[0..n]);
-
+            try bufs.appendWithProcessing(self.allocator, buf[0..n]);
             // weve logged "raw" reads in the readloop, now that we have processed something
             // (ProcessedBuf handles ascii filtering on appendSlice) we can show the processed bits
             logging.traceWithSrc(
@@ -948,7 +1054,7 @@ pub const Session = struct {
                 search_depth,
             );
 
-            var match_indexes = try checkF(check_args, searchable_buf);
+            var match_indexes = try check_f(check_args, searchable_buf);
 
             logging.traceWithSrc(
                 self.log,
@@ -997,8 +1103,25 @@ pub const Session = struct {
     ) ![2][]const u8 {
         self.log.info("session.Session readAny requested", .{});
 
-        var bufs = bytes.ProcessedBuf.init(allocator);
-        defer bufs.deinit();
+        const bufs = &self.scratch;
+        try bufs.reset(self.allocator, self.options.scratch_retain_max);
+
+        // read_any is a raw window into the stream, *not* a complete operation result -- the
+        // normalization "leading"/"trailing" rules only make sense when an operation is a whole
+        // logical result, but a read_any op is an arbitrary slice of the stream (and callers,
+        // like readWithCallbacks, concatenate those slices!). left on, every fragment-boundary
+        // newline would get journaled away as "leading"/"trailing" and the concatenated output
+        // would collapse into one giant line. so: no normalization at all for read_any.
+        const normalize_line_feeds = bufs.normalize_line_feeds;
+        const normalize_trailing_whitespace = bufs.normalize_trailing_whitespace;
+
+        bufs.normalize_line_feeds = false;
+        bufs.normalize_trailing_whitespace = false;
+
+        defer {
+            bufs.normalize_line_feeds = normalize_line_feeds;
+            bufs.normalize_trailing_whitespace = normalize_trailing_whitespace;
+        }
 
         const start_time = std.Io.Timestamp.now(self.io, .awake);
 
@@ -1007,11 +1130,11 @@ pub const Session = struct {
             options.cancel,
             bytes_check.nonZeroBuf,
             .{},
-            &bufs,
+            bufs,
             self.options.operation_max_search_depth,
         );
 
-        return bufs.toOwnedSlices();
+        return bufs.dupeOwnedSlices(allocator);
     }
 
     /// Gets the current "prompt" from the device -- for Cli connections usually -- the prompt is
@@ -1025,51 +1148,63 @@ pub const Session = struct {
 
         try self.writeReturn();
 
-        var bufs = bytes.ProcessedBuf.init(allocator);
-        defer bufs.deinit();
+        const bufs = &self.scratch;
+        try bufs.reset(self.allocator, self.options.scratch_retain_max);
 
         const start_time = std.Io.Timestamp.now(self.io, .awake);
 
-        _ = try self.readTimeout(
+        const match_indexes = try self.readTimeout(
             start_time,
             options.cancel,
             bytes_check.patternInBuf,
             .{
                 .pattern = self.compiled_prompt_pattern,
+                .excludes = self.prompt_excludes,
             },
-            &bufs,
+            bufs,
             self.options.operation_max_search_depth,
         );
 
-        // pcre2Find returns a slice from the haystack, so we need to persist that in memory
-        // through that function call (cant just return pcre2Find)
-        const found_prompt = try re.pcre2Find(
-            self.compiled_prompt_pattern.?,
-            bufs.processed.items,
-        );
+        // use the match positions readTimeout already found rather than re-searching -- a
+        // re-search could land on an earlier (i.e. prompt exclude filtered) match. defensively
+        // clamp the end since readTimeout positions are relative to the processed buf
+        const matched_prompt = bufs.processed.items[match_indexes.start..@min(
+            match_indexes.end,
+            bufs.processed.items.len,
+        )];
 
-        if (found_prompt == null) {
-            return errors.wrapCriticalError(
-                errors.ScrapliError.Driver,
-                @src(),
-                self.log,
-                "session.Session getPrompt: no prompt found matching prompt pattern '{s}' in '{s}'",
-                .{ self.prompt_pattern, bufs.processed.items },
-            );
-        }
+        // the two consumers of the match want different trims:
+        //
+        // the *returned* prompt (the operation result) gets trailing whitespace fully trimmed --
+        // since thats probably what users would expect, just a hey "what is the prompt on the box
+        // rn", and they dont care about the whitepace.
+        //
+        // the *retained* prompt (used to compose "prompt + input" for the next op when
+        // retain_input is set) keeps trailing spaces/tabs -- thats real prompt content that
+        // becomes interior once the input echo lands after it (think "A:srl# enter candidate")
+        // -- but still drops newlines for the same nondeterminism reason. any of the prompt's
+        // trailing whitespace thats sitting *pending* in the buf (it usually is -- pending is
+        // exactly how whitespace waits to learn if its trailing) gets tacked on as well.
+        const found_prompt = std.mem.trimEnd(u8, matched_prompt, " \t\n\r");
 
-        const owned_found_prompt = try allocator.alloc(u8, found_prompt.?.len);
-        @memcpy(owned_found_prompt, found_prompt.?);
+        // the match is a view into the (reused) scratch buffer, and both consumers need their
+        // own copy with their own allocator: the caller owns the returned prompt (operation
+        // allocator), and the session retains its own (session allocator) for prepending to
+        // the next operation's buf
+        const owned_found_prompt = try allocator.dupe(u8, found_prompt);
+        errdefer allocator.free(owned_found_prompt);
 
-        // we want to ensure we are storing the last consumed prompt so that our send_input
-        // buf is always "correct" when "retain_input" is true
-        try self.last_consumed_prompt.resize(self.allocator, 0);
+        self.last_consumed_prompt.clearRetainingCapacity();
         try self.last_consumed_prompt.appendSlice(
             self.allocator,
-            owned_found_prompt,
+            matched_prompt,
         );
+        try bufs.appendPendingKeptTo(self.allocator, &self.last_consumed_prompt);
 
-        return [2][]const u8{ try bufs.raw.toOwnedSlice(allocator), owned_found_prompt };
+        // TODO probably just return the found prompt here instead?
+        // the "processed" side of a getPrompt result is only ever the prompt itself, so we just
+        // return an empty string for the raw side of things.
+        return [2][]const u8{ try allocator.dupe(u8, ""), owned_found_prompt };
     }
 
     fn innerSendInput(
@@ -1078,8 +1213,11 @@ pub const Session = struct {
         cancel: ?*bool,
         input: []const u8,
         input_handling: operation.InputHandling,
+        redact_input: bool,
         bufs: *bytes.ProcessedBuf,
     ) !bytes_check.MatchPositions {
+        var mut_input_handling = input_handling;
+
         logging.traceWithSrc(
             self.log,
             @src(),
@@ -1087,7 +1225,7 @@ pub const Session = struct {
             .{
                 @tagName(input_handling),
                 input.len,
-                input,
+                if (redact_input) "<redacted>" else input,
             },
         );
 
@@ -1096,7 +1234,13 @@ pub const Session = struct {
             .actual = input,
         };
 
-        try self.write(input, false);
+        try self.write(input, redact_input);
+
+        if (input.len == 0) {
+            // for whatever reason user sent nothing, we cant search for nothing, so ignore
+            // whatever they asked for and set input handling to ignore
+            mut_input_handling = .ignore;
+        }
 
         var match_indexes: bytes_check.MatchPositions = .{ .start = 0, .end = 0 };
 
@@ -1110,7 +1254,7 @@ pub const Session = struct {
             search_depth = input.len * 4;
         }
 
-        switch (input_handling) {
+        switch (mut_input_handling) {
             .exact => {
                 match_indexes = try self.readTimeout(
                     start_time,
@@ -1132,11 +1276,7 @@ pub const Session = struct {
                 );
             },
             .ignore => {
-                // ignore, not reading input; to not break our saftey rule above we return here
-                // when in "ignore" handling mode
-                try self.writeReturn();
-
-                return match_indexes;
+                // nothing to do, we'll drop out and hit return
             },
         }
 
@@ -1150,22 +1290,29 @@ pub const Session = struct {
             return;
         }
 
-        try bufs.appendSlice(self.last_consumed_prompt.items);
+        try bufs.appendWithProcessing(self.allocator, self.last_consumed_prompt.items);
         try self.last_consumed_prompt.resize(self.allocator, 0);
     }
 
     fn storeLastConsumedPrompt(
         self: *Session,
+        bufs: *bytes.ProcessedBuf,
         buf: []const u8,
     ) !void {
         try self.last_consumed_prompt.appendSlice(self.allocator, buf);
+
+        // the prompt's trailing whitespace (i.e. "A:srl# " <- that space) is generally *pending*
+        // in the buf at match time rather than in processed, but its part of the prompt as far
+        // as composing "prompt + input" for the next retained-input op goes, so grab it too
+        try bufs.appendPendingKeptTo(self.allocator, &self.last_consumed_prompt);
     }
 
     /// Sends the given input to the transport, reading until the input is written, then sending
-    /// return, then reading until the next prompt is read. It returns two buffers -- the "raw"
-    /// buffer, that is the unprocessed content that we read from the device, and the "processed"
-    /// buffer, that is the content that was processed -- i.e. had ascii/ansi control chars
-    /// removed to give only human readable text output.
+    /// return, then reading until the next prompt is read. It returns two buffers -- the
+    /// journaled "raw" buffer, from which the raw/unprocessed content read from the device can
+    /// be reconstructed on demand (see bytes.reconstructRaw), and the "processed" buffer, that
+    /// is the content that was processed -- i.e. had ascii/ansi control chars removed to give
+    /// only human readable text output.
     pub fn sendInput(
         self: *Session,
         allocator: std.mem.Allocator,
@@ -1176,22 +1323,25 @@ pub const Session = struct {
 
         const start_time = std.Io.Timestamp.now(self.io, .awake);
 
-        var bufs = bytes.ProcessedBuf.init(allocator);
-        defer bufs.deinit();
+        const bufs = &self.scratch;
+        try bufs.reset(self.allocator, self.options.scratch_retain_max);
 
-        try self.prependLastConsumedPrompt(&bufs);
+        try self.prependLastConsumedPrompt(bufs);
 
         _ = try self.innerSendInput(
             start_time,
             options.cancel,
             options.input,
             options.input_handling,
-            &bufs,
+            false,
+            bufs,
         );
 
         if (!options.retain_input) {
-            // if we dont want to retain inputs, just resize the processed buffer to 0
-            try bufs.processed.resize(self.allocator, 0);
+            // if we dont want to retain inputs trim *everything* read so far (the input
+            // echo) out of the processed buf -- it lands in the raw journal so the raw
+            // output still contains it
+            try bufs.rightTrimProcessed(self.allocator, 0);
         }
 
         // Terminate the trailing prompt read on the *active mode's* prompt pattern when the driver
@@ -1203,33 +1353,34 @@ pub const Session = struct {
         const check_args = bytes_check.CheckArgs{
             .pattern = options._mode_prompt_pattern orelse self.compiled_prompt_pattern,
             .actual = options.input,
+            .excludes = self.prompt_excludes,
         };
 
-        var prompt_indexes = try self.readTimeout(
+        const prompt_indexes = try self.readTimeout(
             start_time,
             options.cancel,
             bytes_check.patternInBuf,
             check_args,
-            &bufs,
+            bufs,
             self.options.operation_max_search_depth,
         );
 
         try self.storeLastConsumedPrompt(
+            bufs,
             bufs.processed.items[prompt_indexes.start..prompt_indexes.end],
         );
 
         if (!options.retain_trailing_prompt) {
-            // using the prompt indexes, replace that range holding the trailing prompt out
-            // of the processed buf
-            try bufs.processed.replaceRange(
+            // trim the trailing prompt (and anything after it, which should be nothing)
+            // out of the processed buf -- it lands in the raw journal so the raw output
+            // still contains it
+            try bufs.rightTrimProcessed(
                 self.allocator,
                 prompt_indexes.start,
-                prompt_indexes.len(),
-                "",
             );
         }
 
-        return bufs.toOwnedSlices();
+        return bufs.dupeOwnedSlices(allocator);
     }
 
     /// Sends an input to the device -- an input that initiates some kind of "prompted" response by
@@ -1245,7 +1396,10 @@ pub const Session = struct {
         self.log.info("session.Session sendPromptedInput requested", .{});
         self.log.debug(
             "session.Session sendPromptedInput: input '{s}', response '{s}'",
-            .{ options.input, options.response },
+            .{
+                options.input,
+                if (options.hidden_response) "<redacted>" else options.response,
+            },
         );
 
         const start_time = std.Io.Timestamp.now(self.io, .awake);
@@ -1254,8 +1408,11 @@ pub const Session = struct {
 
         if (options.prompt_pattern) |pattern| {
             if (pattern.len > 0) {
-                compiled_pattern = re.pcre2Compile(pattern);
-                if (compiled_pattern == null) {
+                compiled_pattern = re.pcre2Compile(pattern) orelse {
+                    self.last_error.set(
+                        "session.Session sendPromptedInput: failed compiling pattern",
+                    );
+
                     return errors.wrapCriticalError(
                         errors.ScrapliError.Driver,
                         @src(),
@@ -1263,7 +1420,7 @@ pub const Session = struct {
                         "session.Session sendPromptedInput: failed compiling pattern '{s}'",
                         .{pattern},
                     );
-                }
+                };
             }
         }
 
@@ -1273,115 +1430,399 @@ pub const Session = struct {
             }
         }
 
-        if (options.abort_input) |abort_input| {
-            errdefer {
-                self.writeAndReturn(abort_input, false) catch |err| {
-                    self.log.critical(
-                        "session.Session sendPromptedInput: failed sending abort sequence " ++
-                            "after error in prompted input, err: {}",
-                        .{err},
-                    );
-                };
-            }
-        }
+        errdefer if (options.abort_input) |abort_input| {
+            self.writeAndReturn(abort_input, false) catch |err| {
+                self.log.critical(
+                    "session.Session sendPromptedInput: failed sending abort sequence " ++
+                        "after error in prompted input, err: {}",
+                    .{err},
+                );
+            };
+        };
 
-        var bufs = bytes.ProcessedBuf.init(allocator);
-        defer bufs.deinit();
+        const bufs = &self.scratch;
+        try bufs.reset(self.allocator, self.options.scratch_retain_max);
 
-        try self.prependLastConsumedPrompt(&bufs);
+        try self.prependLastConsumedPrompt(bufs);
 
         _ = try self.innerSendInput(
             start_time,
             options.cancel,
             options.input,
             options.input_handling,
-            &bufs,
+            false,
+            bufs,
         );
 
-        const responseCheckF: bytes_check.CheckF =
+        const response_check_f: bytes_check.CheckF =
             if (compiled_pattern) |_| &bytes_check.anyPatternInBuf else &bytes_check.exactInBuf;
 
-        var check_args = bytes_check.CheckArgs{
+        var response_check_args = bytes_check.CheckArgs{
             .actual = options.prompt_exact,
+            .excludes = self.prompt_excludes,
         };
 
         if (compiled_pattern) |cp| {
-            check_args.patterns = &[_]?*re.pcre2CompiledPattern{
+            response_check_args.patterns = &[_]?*re.pcre2CompiledPattern{
                 self.compiled_prompt_pattern,
                 cp,
             };
         } else {
-            check_args.pattern = self.compiled_prompt_pattern;
+            response_check_args.pattern = self.compiled_prompt_pattern;
         }
 
         _ = try self.readTimeout(
             start_time,
             options.cancel,
-            responseCheckF,
-            check_args,
-            &bufs,
+            response_check_f,
+            response_check_args,
+            bufs,
             self.options.operation_max_search_depth,
         );
 
         if (!options.hidden_response) {
-            try self.writeAndReturn(options.response, true);
+            try self.writeAndReturn(options.response, options.hidden_response);
         } else {
             _ = try self.innerSendInput(
                 start_time,
                 options.cancel,
                 options.response,
                 options.input_handling,
-                &bufs,
+                true,
+                bufs,
             );
         }
 
-        var prompt_indexes = try self.readTimeout(
+        const final_prompt_check_args = bytes_check.CheckArgs{
+            .pattern = self.compiled_prompt_pattern,
+            .excludes = self.prompt_excludes,
+        };
+
+        const prompt_indexes = try self.readTimeout(
             start_time,
             options.cancel,
             bytes_check.patternInBuf,
-            check_args,
-            &bufs,
+            final_prompt_check_args,
+            bufs,
             self.options.operation_max_search_depth,
         );
 
         try self.storeLastConsumedPrompt(
+            bufs,
             bufs.processed.items[prompt_indexes.start..prompt_indexes.end],
         );
 
         if (!options.retain_trailing_prompt) {
-            // using the prompt indexes, replace that range holding the trailing prompt out
-            // of the processed buf
-            try bufs.processed.replaceRange(
+            // trim the trailing prompt (and anything after it, which should be nothing)
+            // out of the processed buf -- it lands in the raw journal so the raw output
+            // still contains it
+            try bufs.rightTrimProcessed(
                 self.allocator,
                 prompt_indexes.start,
-                prompt_indexes.len(),
-                "",
             );
         }
 
-        return bufs.toOwnedSlices();
+        return bufs.dupeOwnedSlices(allocator);
     }
 };
 
 test "sessionInit" {
-    const o = try Options.init(std.testing.allocator, .{});
-    const a_o = try auth.Options.init(std.testing.allocator, .{});
-    const t_o = try transport.Options.init(std.testing.allocator, .{ .bin = .{} });
+    var o = try Options.init(std.testing.allocator, .{});
 
-    const s = try Session.init(
+    var s = try Session.init(
         std.testing.allocator,
         std.testing.io,
         logging.Logger{
             .allocator = std.testing.allocator,
         },
         ">",
+        null,
         o,
-        a_o,
-        t_o,
+        .{},
+        .{
+            .bin = .{},
+        },
     );
 
     s.deinit();
-    o.deinit();
-    a_o.deinit();
-    t_o.deinit();
+    o.deinit(std.testing.allocator);
+}
+
+test "refAllDecls" {
+    std.testing.refAllDecls(Session);
+}
+
+fn sessionInitForAllocFailures(allocator: std.mem.Allocator) !void {
+    var s = try Session.init(
+        allocator,
+        std.testing.io,
+        logging.Logger{
+            .allocator = allocator,
+        },
+        ">",
+        null,
+        .{},
+        .{},
+        .{
+            .bin = .{},
+        },
+    );
+
+    s.deinit();
+}
+
+test "sessionInitAllocationFailures" {
+    // fail each allocation in the init path once, proving the errdefer/deinit unwind neither
+    // leaks nor touches uninitialized state under real allocation failure
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        sessionInitForAllocFailures,
+        .{},
+    );
+}
+
+fn optionsInitForAllocFailures(allocator: std.mem.Allocator) !void {
+    // options w/ all owned fields populated so allocation failures at any point during the
+    // copy exercise the partial-failure cleanup path (and would catch any invalid free of
+    // caller owned memory)
+    const o = try Options.init(
+        allocator,
+        .{
+            .return_char = "\r\n",
+            .record_destination = .{
+                .f = "record-out.log",
+            },
+        },
+    );
+
+    o.deinit(allocator);
+}
+
+test "optionsInitAllocationFailures" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        optionsInitForAllocFailures,
+        .{},
+    );
+}
+
+test "session readTimeout" {
+    const cases = [_]struct {
+        name: []const u8,
+        transport_opts: transport_test.Options,
+        check_args: bytes_check.CheckArgs,
+        timeout_ns: u64 = 1_000_000_000,
+        search_depth: ?u64 = null,
+        cancel: bool = false,
+        min_elapsed_ns: u64 = 0,
+        expected_err: ?anyerror = null,
+        expected: bytes_check.MatchPositions = .{
+            .start = 0,
+            .end = 0,
+        },
+        expected_processed: ?[]const u8 = null,
+        second_check_args: ?bytes_check.CheckArgs = null,
+        second_expected: bytes_check.MatchPositions = .{
+            .start = 0,
+            .end = 0,
+        },
+    }{
+        .{
+            .name = "simple",
+            .transport_opts = .{
+                .content = "fooer",
+            },
+            .check_args = .{
+                .actual = "fooer",
+            },
+            .expected = .{
+                .start = 0,
+                .end = 5,
+            },
+            .expected_processed = "fooer",
+        },
+        .{
+            .name = "eof",
+            .transport_opts = .{
+                .content = "fooer",
+                .eof_at = 3,
+            },
+            .check_args = .{
+                .actual = "fooerzzzzz",
+            },
+            .expected_err = errors.ScrapliError.EOF,
+            .expected_processed = "foo",
+        },
+        .{
+            .name = "timeout",
+            .transport_opts = .{
+                .content = "fooer",
+                .pause_at = &[_]transport_test.Pause{
+                    .{
+                        .pos = 3,
+                        .ns = 1_000_000_000,
+                    },
+                },
+            },
+            .check_args = .{
+                .actual = "fooerzzzzz",
+            },
+            .timeout_ns = 250_000_000,
+            .expected_err = errors.ScrapliError.TimeoutExceeded,
+            .expected_processed = "foo",
+        },
+        .{
+            .name = "prior match ignored",
+            .transport_opts = .{
+                .content = "foo>bar>",
+            },
+            .check_args = .{
+                .actual = ">",
+            },
+            .expected = .{
+                .start = 3,
+                .end = 4,
+            },
+            .second_check_args = .{
+                .actual = ">",
+            },
+            .second_expected = .{
+                .start = 7,
+                .end = 8,
+            },
+            .expected_processed = "foo>bar>",
+        },
+        .{
+            .name = "search depth",
+            .transport_opts = .{
+                .content = "zzzz>",
+            },
+            .check_args = .{
+                .actual = ">",
+            },
+            .search_depth = 1,
+            .expected = .{
+                .start = 4,
+                .end = 5,
+            },
+            .expected_processed = "zzzz>",
+        },
+        .{
+            .name = "cancelled",
+            .transport_opts = .{
+                .content = "fooer",
+            },
+            .check_args = .{
+                .actual = "zzzzz",
+            },
+            .cancel = true,
+            .expected_err = errors.ScrapliError.Cancelled,
+        },
+        .{
+            // match cannot be reported before its bytes actually arrive
+            .name = "pause then match",
+            .transport_opts = .{
+                .content = "foo>",
+                .pause_at = &[_]transport_test.Pause{
+                    .{
+                        .pos = 3,
+                        .ns = 50_000_000,
+                    },
+                },
+            },
+            .check_args = .{
+                .actual = ">",
+            },
+            .expected = .{
+                .start = 3,
+                .end = 4,
+            },
+            .min_elapsed_ns = 50_000_000,
+            .expected_processed = "foo>",
+        },
+    };
+
+    for (cases) |case| {
+        var s = try Session.init(
+            std.testing.allocator,
+            std.testing.io,
+            logging.Logger{
+                .allocator = std.testing.allocator,
+            },
+            ">",
+            null,
+            .{
+                .read_size = 1,
+                .operation_timeout_ns = case.timeout_ns,
+            },
+            .{
+                // doesnt exist for our test but we do need to "open" the session to get the read
+                // thread kicked off, so just skip the auth bits
+                .bypass_in_session_auth = true,
+            },
+            .{
+                .test_ = case.transport_opts,
+            },
+        );
+
+        defer s.deinit();
+
+        _ = try s.open(std.testing.allocator, "dummy", 22, null);
+
+        var bufs: bytes.ProcessedBuf = .{};
+        defer bufs.deinit(std.testing.allocator);
+
+        var cancel_flag: bool = case.cancel;
+
+        const start_timestamp: std.Io.Timestamp = .now(std.testing.io, .awake);
+
+        const ret = s.readTimeout(
+            start_timestamp,
+            &cancel_flag,
+            bytes_check.exactInBuf,
+            case.check_args,
+            &bufs,
+            case.search_depth orelse case.transport_opts.content.?.len,
+        );
+
+        if (case.expected_err) |e| {
+            try std.testing.expectError(e, ret);
+
+            if (case.expected_processed) |expected| {
+                try std.testing.expectEqualStrings(expected, bufs.processed.items);
+            }
+
+            continue;
+        }
+
+        const actual = try ret;
+
+        try std.testing.expectEqual(case.expected.start, actual.start);
+        try std.testing.expectEqual(case.expected.end, actual.end);
+
+        if (case.min_elapsed_ns != 0) {
+            try std.testing.expect(
+                start_timestamp.untilNow(std.testing.io, .awake).nanoseconds >=
+                    case.min_elapsed_ns,
+            );
+        }
+
+        if (case.second_check_args) |second_check_args| {
+            const second = try s.readTimeout(
+                .now(std.testing.io, .awake),
+                null,
+                bytes_check.exactInBuf,
+                second_check_args,
+                &bufs,
+                case.transport_opts.content.?.len,
+            );
+
+            try std.testing.expectEqual(case.second_expected.start, second.start);
+            try std.testing.expectEqual(case.second_expected.end, second.end);
+        }
+
+        if (case.expected_processed) |expected| {
+            try std.testing.expectEqualStrings(expected, bufs.processed.items);
+        }
+    }
 }

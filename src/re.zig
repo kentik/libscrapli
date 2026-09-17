@@ -1,7 +1,10 @@
 const std = @import("std");
-const pcre2 = @import("pcre2");
 
+const errors = @import("errors.zig");
+
+const pcre2 = @import("pcre2");
 /// Alias for pcre2 compiled pattern to a more clear name.
+// zlinter-disable declaration_naming
 pub const pcre2CompiledPattern = pcre2.pcre2_code_8;
 
 /// Conveinence function to free a pcre2 compiled object.
@@ -114,14 +117,14 @@ pub fn pcre2Find(
             err_message_buf[0..@intCast(err_message_len)],
         });
 
-        return error.Regex;
+        return errors.ScrapliError.PatternError;
     } else if (rc == 0) {
         std.log.err(
             "match vectors was not big enough for all captured substrings",
             .{},
         );
 
-        return error.Regex;
+        return errors.ScrapliError.PatternError;
     }
 
     const match_vectors = pcre2.pcre2_get_ovector_pointer_8(matches);
@@ -129,7 +132,7 @@ pub fn pcre2Find(
     if (match_vectors[0] > match_vectors[1]) {
         std.log.err("match vectors first match pointers invalid", .{});
 
-        return error.Regex;
+        return errors.ScrapliError.PatternError;
     }
 
     const match = haystack[match_vectors[0]..match_vectors[1]];
@@ -161,7 +164,7 @@ test "pcre2Find" {
     for (cases) |case| {
         const compiled_pattern = pcre2Compile(case.pattern);
         if (compiled_pattern == null) {
-            return error.Regex;
+            return errors.ScrapliError.PatternError;
         }
 
         defer pcre2Free(compiled_pattern.?);
@@ -184,6 +187,17 @@ pub fn pcre2FindIndex(
     regexp: *pcre2.pcre2_code_8,
     haystack: []const u8,
 ) ![2]usize {
+    return pcre2FindIndexAt(regexp, haystack, 0);
+}
+
+/// Like pcre2FindIndex but starts matching at the given offset into the haystack. Unlike simply
+/// slicing the haystack, pcre2 retains the real subject start, so anchors ('^' w/ multiline)
+/// behave correctly when resuming a search partway through a buffer.
+pub fn pcre2FindIndexAt(
+    regexp: *pcre2.pcre2_code_8,
+    haystack: []const u8,
+    offset: usize,
+) ![2]usize {
     const matches: ?*pcre2.pcre2_match_data_8 = pcre2.pcre2_match_data_create_from_pattern_8(
         regexp,
         null,
@@ -194,7 +208,7 @@ pub fn pcre2FindIndex(
         regexp,
         &haystack[0],
         haystack.len,
-        0,
+        offset,
         0,
         matches.?,
         null,
@@ -219,14 +233,14 @@ pub fn pcre2FindIndex(
             err_message_buf[0..@intCast(err_message_len)],
         });
 
-        return error.Regex;
+        return errors.ScrapliError.PatternError;
     } else if (rc == 0) {
         std.log.err(
             "match vectors was not big enough for all captured substrings",
             .{},
         );
 
-        return error.Regex;
+        return errors.ScrapliError.PatternError;
     }
 
     const match_vectors = pcre2.pcre2_get_ovector_pointer_8(matches);
@@ -234,7 +248,7 @@ pub fn pcre2FindIndex(
     if (match_vectors[0] > match_vectors[1]) {
         std.log.err("match vectors first match pointers invalid", .{});
 
-        return error.Regex;
+        return errors.ScrapliError.PatternError;
     }
 
     return [2]usize{ match_vectors[0], match_vectors[1] };
