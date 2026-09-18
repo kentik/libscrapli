@@ -205,7 +205,7 @@ test "sendInputsOptionsFromArgs invalid input_handling" {
             std.testing.allocator,
             &cancel,
             inputs,
-            &input_lens,
+            input_lens[0..],
             "",
             &input_handling,
             false,
