@@ -16,7 +16,7 @@ pub fn build(b: *std.Build) !void {
     defer b.allocator.free(generate_result.stderr);
 
     switch (generate_result.term) {
-        .Exited => |code| {
+        .exited => |code| {
             if (code != 0) {
                 std.log.err(
                     "generate.sh exited with code {d}\nstdout:\n{s}\nstderr:\n{s}",
@@ -27,7 +27,7 @@ pub fn build(b: *std.Build) !void {
         },
         else => {
             std.log.err(
-                "generate.sh terminated abnormally: {any}\nstdout:\n{s}\nstderr:\n{s}",
+                "generate.sh terminated abnormally: {f}\nstdout:\n{s}\nstderr:\n{s}",
                 .{ generate_result.term, generate_result.stdout, generate_result.stderr },
             );
             return error.OpenSSLGenerateFailed;
