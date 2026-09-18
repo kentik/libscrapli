@@ -97,6 +97,9 @@ pub const Logger = struct {
         if (level != LogLevel.fatal and @backingInt(self.level) > @backingInt(level)) {
             return;
         }
+        if (self.f == null) {
+            return;
+        }
 
         const formatted_message = self.sprintf(format, args);
 
@@ -108,15 +111,13 @@ pub const Logger = struct {
 
         var msg: []u8 = formatted_message orelse @constCast(format);
 
-        if (self.f) |f| {
-            switch (f) {
-                .z => |cb| {
-                    cb(@backingInt(level), &msg);
-                },
-                .ffi => |ffi_cb| {
-                    ffi_cb.cb(ffi_cb.user_data, @backingInt(level), &msg);
-                },
-            }
+        switch (self.f.?) {
+            .z => |cb| {
+                cb(@backingInt(level), &msg);
+            },
+            .ffi => |ffi_cb| {
+                ffi_cb.cb(ffi_cb.user_data, @backingInt(level), &msg);
+            },
         }
     }
 

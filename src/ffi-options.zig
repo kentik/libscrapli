@@ -2,6 +2,7 @@ const std = @import("std");
 
 const auth = @import("auth.zig");
 const cli = @import("cli.zig");
+const errors = @import("errors.zig");
 const ffi_common = @import("ffi-common.zig");
 const logging = @import("logging.zig");
 const netconf = @import("netconf.zig");
@@ -24,10 +25,10 @@ pub const FFIOptions = extern struct {
         level: u8,
         message: *const []u8,
     ) callconv(.c) void = null,
-    logger_level: u8 = 4,
+    logger_level: u8 = 0,
 
     port: ?*u16 = null,
-    transport_kind: u8 = 1,
+    transport_kind: u8 = 0,
 
     cli: extern struct {
         definition_str: [*c]const u8 = undefined,
@@ -255,8 +256,8 @@ pub const FFIOptions = extern struct {
         return o;
     }
 
-    fn transportOptionsInputs(self: *FFIOptions) transport.Options {
-        const transport_kind: transport.Kind = @fromBackingInt(@intCast(self.transport_kind));
+    fn transportOptionsInputs(self: *FFIOptions) errors.ScrapliError!transport.Options {
+        const transport_kind = try parseTransportKind(self.transport_kind);
 
         switch (transport_kind) {
             transport.Kind.bin => {
@@ -363,7 +364,7 @@ pub const FFIOptions = extern struct {
     }
 
     /// Returns a cli options struct from this ffi options struct.
-    pub fn cliOptions(self: *FFIOptions, allocator: std.mem.Allocator) cli.Options {
+    pub fn cliOptions(self: *FFIOptions, allocator: std.mem.Allocator) errors.ScrapliError!cli.Options {
         var l: ?logging.Logger = null;
         if (self.loggerCallback) |cb| {
             l = logging.Logger{
@@ -374,7 +375,7 @@ pub const FFIOptions = extern struct {
                         .cb = cb,
                     },
                 },
-                .level = @fromBackingInt(@intCast(self.logger_level)),
+                .level = try parseLoggerLevel(self.logger_level),
             };
         }
 
@@ -386,12 +387,12 @@ pub const FFIOptions = extern struct {
             .port = if (self.port) |v| v.* else null,
             .auth = self.authOptionsInputs(),
             .session = self.sessionOptionsInputs(),
-            .transport = self.transportOptionsInputs(),
+            .transport = try self.transportOptionsInputs(),
         };
     }
 
     /// Returns a netconf options struct from this ffi options struct.
-    pub fn netconfOptions(self: *FFIOptions, allocator: std.mem.Allocator) netconf.Options {
+    pub fn netconfOptions(self: *FFIOptions, allocator: std.mem.Allocator) errors.ScrapliError!netconf.Options {
         var l: ?logging.Logger = null;
         if (self.loggerCallback) |cb| {
             l = logging.Logger{
@@ -402,7 +403,7 @@ pub const FFIOptions = extern struct {
                         .cb = cb,
                     },
                 },
-                .level = @fromBackingInt(@intCast(self.logger_level)),
+                .level = try parseLoggerLevel(self.logger_level),
             };
         }
 
@@ -410,7 +411,7 @@ pub const FFIOptions = extern struct {
             .logger = l,
             .auth = self.authOptionsInputs(),
             .session = self.sessionOptionsInputs(),
-            .transport = self.transportOptionsInputs(),
+            .transport = try self.transportOptionsInputs(),
             .capabilities_callback = if (self.netconf.capabilitiesCallback) |cb| .{
                 .ffi = .{
                     .user_data = self.user_data,
@@ -509,6 +510,28 @@ fn redactedStr(len: usize) []const u8 {
     return "REDACTED";
 }
 
+fn parseTransportKind(v: u8) errors.ScrapliError!transport.Kind {
+    return switch (v) {
+        0 => transport.Kind.bin,
+        1 => transport.Kind.telnet,
+        2 => transport.Kind.ssh2,
+        3 => transport.Kind.test_,
+        else => errors.ScrapliError.InvalidArgument,
+    };
+}
+
+fn parseLoggerLevel(v: u8) errors.ScrapliError!logging.LogLevel {
+    return switch (v) {
+        0 => logging.LogLevel.warn,
+        1 => logging.LogLevel.trace,
+        2 => logging.LogLevel.debug,
+        3 => logging.LogLevel.info,
+        4 => logging.LogLevel.critical,
+        5 => logging.LogLevel.fatal,
+        else => errors.ScrapliError.InvalidArgument,
+    };
+}
+
 const ffi_options_top_level_args_json_ish_placeholder =
     \\    "logger_level": "{s}",
     \\    "transport_kind": "{s}",
@@ -516,8 +539,8 @@ const ffi_options_top_level_args_json_ish_placeholder =
 ;
 
 fn ffiOptionsTopLevelToJSON(allocator: std.mem.Allocator, o: *const FFIOptions) ![]u8 {
-    const transport_kind: transport.Kind = @fromBackingInt(@intCast(o.transport_kind));
-    const logger_level: logging.LogLevel = @fromBackingInt(@intCast(o.logger_level));
+    const transport_kind = try parseTransportKind(o.transport_kind);
+    const logger_level = try parseLoggerLevel(o.logger_level);
 
     return allocator.print(
         ffi_options_top_level_args_json_ish_placeholder,
