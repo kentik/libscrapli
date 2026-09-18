@@ -365,6 +365,7 @@ pub const FFIOptions = extern struct {
 
     /// Returns a cli options struct from this ffi options struct.
     pub fn cliOptions(self: *FFIOptions, allocator: std.mem.Allocator) errors.ScrapliError!cli.Options {
+        const logger_level = try parseLoggerLevel(self.logger_level);
         var l: ?logging.Logger = null;
         if (self.loggerCallback) |cb| {
             l = logging.Logger{
@@ -375,7 +376,7 @@ pub const FFIOptions = extern struct {
                         .cb = cb,
                     },
                 },
-                .level = try parseLoggerLevel(self.logger_level),
+                .level = logger_level,
             };
         }
 
@@ -393,6 +394,7 @@ pub const FFIOptions = extern struct {
 
     /// Returns a netconf options struct from this ffi options struct.
     pub fn netconfOptions(self: *FFIOptions, allocator: std.mem.Allocator) errors.ScrapliError!netconf.Options {
+        const logger_level = try parseLoggerLevel(self.logger_level);
         var l: ?logging.Logger = null;
         if (self.loggerCallback) |cb| {
             l = logging.Logger{
@@ -403,7 +405,7 @@ pub const FFIOptions = extern struct {
                         .cb = cb,
                     },
                 },
-                .level = try parseLoggerLevel(self.logger_level),
+                .level = logger_level,
             };
         }
 
