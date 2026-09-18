@@ -118,6 +118,7 @@ pub fn toFfiResult(err: anyerror) u8 {
         errors.ScrapliError.Session => FfiResult.session,
         errors.ScrapliError.Transport => FfiResult.transport,
         errors.ScrapliError.Operation => FfiResult.operation,
+        errors.ScrapliError.InvalidArgument => FfiResult.invalid_argument,
         else => FfiResult.unknown,
     };
 
