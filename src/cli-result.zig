@@ -96,8 +96,10 @@ pub const Result = struct {
     ) !void {
         try self.splits_ns.append(self.allocator, std.Io.Timestamp.now(self.io, .real).nanoseconds);
         const input_copy = try self.allocator.dupe(u8, data.input);
-        errdefer self.allocator.free(input_copy);
-        try self.inputs.append(self.allocator, input_copy);
+        {
+            errdefer self.allocator.free(input_copy);
+            try self.inputs.append(self.allocator, input_copy);
+        }
         try self.results_raw_journal.append(self.allocator, data.rets[0]);
 
         try self.results.append(self.allocator, data.rets[1]);

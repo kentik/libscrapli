@@ -90,6 +90,16 @@ test "once concurrent callers execute initializer once" {
     var start = std.atomic.Value(bool).init(false);
     var results: [16]usize = undefined;
     var threads: [results.len]std.Thread = undefined;
+    var spawned: usize = 0;
+    errdefer {
+        // if a later spawn fails, the already-created workers are still spinning on
+        // `start`; release them and join before returning so we don't leak threads or
+        // leave them reading invalid stack memory.
+        start.store(true, .release);
+        for (threads[0..spawned]) |thread| {
+            thread.join();
+        }
+    }
 
     for (0..results.len) |idx| {
         threads[idx] = try std.Thread.spawn(
@@ -101,6 +111,7 @@ test "once concurrent callers execute initializer once" {
                 &results[idx],
             },
         );
+        spawned += 1;
     }
 
     start.store(true, .release);
