@@ -93,7 +93,7 @@ test "once concurrent callers execute initializer once" {
     var spawned: usize = 0;
     errdefer {
         // if a later spawn fails, the already-created workers are still spinning on
-        // `start`; release them and join before returning so we dont leak threads or
+        // `start`; release them and join before returning so we don't leak threads or
         // leave them reading invalid stack memory.
         start.store(true, .release);
         for (threads[0..spawned]) |thread| {
