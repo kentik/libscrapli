@@ -79,11 +79,15 @@ export fn ls_free_driver_options(options_ptr: *ffi_common.LsOptions) callconv(.c
     defer allocator.destroy(o);
 }
 
-export fn ls_cli_alloc(
+/// Shared implementation backing both the original, ABI-stable `ls_cli_alloc` export and the
+/// newer `ls_cli_alloc_with_result` export. `result_ptr` is optional so callers that don't care
+/// about the detailed failure reason (i.e. the original two-argument symbol) can simply pass
+/// null.
+fn cliAlloc(
     host: [*c]const u8,
     options_ptr: *ffi_common.LsOptions,
     result_ptr: ?*u8,
-) callconv(.c) ?*ffi_common.LsDriver {
+) ?*ffi_common.LsDriver {
     if (host == null) {
         if (result_ptr) |r| {
             r.* = @backingInt(ffi_common.FfiResult.invalid_argument);
@@ -126,11 +130,37 @@ export fn ls_cli_alloc(
     return @ptrCast(d);
 }
 
-export fn ls_netconf_alloc(
+// note: this symbol's signature must remain two arguments -- callers (e.g. ctypes/purego
+// bindings) built against previously released versions of this library invoke it with exactly
+// two arguments, and adding a third argument here would be an abi break (the callee would read
+// an unspecified/garbage value for the missing argument). use `ls_cli_alloc_with_result` if the
+// detailed failure reason is needed.
+export fn ls_cli_alloc(
+    host: [*c]const u8,
+    options_ptr: *ffi_common.LsOptions,
+) callconv(.c) ?*ffi_common.LsDriver {
+    return cliAlloc(host, options_ptr, null);
+}
+
+/// Same as `ls_cli_alloc`, but additionally writes the detailed `FfiResult` status to
+/// `result_ptr` (when non-null) describing why allocation failed (or that it succeeded).
+export fn ls_cli_alloc_with_result(
     host: [*c]const u8,
     options_ptr: *ffi_common.LsOptions,
     result_ptr: ?*u8,
 ) callconv(.c) ?*ffi_common.LsDriver {
+    return cliAlloc(host, options_ptr, result_ptr);
+}
+
+/// Shared implementation backing both the original, ABI-stable `ls_netconf_alloc` export and the
+/// newer `ls_netconf_alloc_with_result` export. `result_ptr` is optional so callers that don't
+/// care about the detailed failure reason (i.e. the original two-argument symbol) can simply
+/// pass null.
+fn netconfAlloc(
+    host: [*c]const u8,
+    options_ptr: *ffi_common.LsOptions,
+    result_ptr: ?*u8,
+) ?*ffi_common.LsDriver {
     if (host == null) {
         if (result_ptr) |r| {
             r.* = @backingInt(ffi_common.FfiResult.invalid_argument);
@@ -171,6 +201,28 @@ export fn ls_netconf_alloc(
     }
 
     return @ptrCast(d);
+}
+
+// note: this symbol's signature must remain two arguments -- callers (e.g. ctypes/purego
+// bindings) built against previously released versions of this library invoke it with exactly
+// two arguments, and adding a third argument here would be an abi break (the callee would read
+// an unspecified/garbage value for the missing argument). use `ls_netconf_alloc_with_result` if
+// the detailed failure reason is needed.
+export fn ls_netconf_alloc(
+    host: [*c]const u8,
+    options_ptr: *ffi_common.LsOptions,
+) callconv(.c) ?*ffi_common.LsDriver {
+    return netconfAlloc(host, options_ptr, null);
+}
+
+/// Same as `ls_netconf_alloc`, but additionally writes the detailed `FfiResult` status to
+/// `result_ptr` (when non-null) describing why allocation failed (or that it succeeded).
+export fn ls_netconf_alloc_with_result(
+    host: [*c]const u8,
+    options_ptr: *ffi_common.LsOptions,
+    result_ptr: ?*u8,
+) callconv(.c) ?*ffi_common.LsDriver {
+    return netconfAlloc(host, options_ptr, result_ptr);
 }
 
 export fn ls_shared_get_poll_fd(
@@ -335,8 +387,31 @@ test "ffi: ls_cli_alloc null host" {
     const options = ls_alloc_driver_options().?;
     defer ls_free_driver_options(options);
 
+    const driver = ls_cli_alloc(null, options);
+    try std.testing.expect(driver == null);
+}
+
+test "ffi: ls_cli_alloc_with_result null host" {
+    const options = ls_alloc_driver_options().?;
+    defer ls_free_driver_options(options);
+
     var result: u8 = 0;
-    const driver = ls_cli_alloc(null, options, &result);
+    const driver = ls_cli_alloc_with_result(null, options, &result);
+    try std.testing.expect(driver == null);
+    try std.testing.expectEqual(@backingInt(ffi_common.FfiResult.invalid_argument), result);
+}
+
+test "ffi: ls_cli_alloc_with_result invalid options" {
+    const options = ls_alloc_driver_options().?;
+    defer ls_free_driver_options(options);
+
+    const o: *ffi_options.FFIOptions = @ptrCast(@alignCast(options));
+    // an out of range logger_level is not a valid logging.LogLevel byte, so converting
+    // this to cli.Options (via `o.cliOptions`) should fail with `InvalidArgument`.
+    o.logger_level = 255;
+
+    var result: u8 = 0;
+    const driver = ls_cli_alloc_with_result("localhost", options, &result);
     try std.testing.expect(driver == null);
     try std.testing.expectEqual(@backingInt(ffi_common.FfiResult.invalid_argument), result);
 }
@@ -345,8 +420,31 @@ test "ffi: ls_netconf_alloc null host" {
     const options = ls_alloc_driver_options().?;
     defer ls_free_driver_options(options);
 
+    const driver = ls_netconf_alloc(null, options);
+    try std.testing.expect(driver == null);
+}
+
+test "ffi: ls_netconf_alloc_with_result null host" {
+    const options = ls_alloc_driver_options().?;
+    defer ls_free_driver_options(options);
+
     var result: u8 = 0;
-    const driver = ls_netconf_alloc(null, options, &result);
+    const driver = ls_netconf_alloc_with_result(null, options, &result);
+    try std.testing.expect(driver == null);
+    try std.testing.expectEqual(@backingInt(ffi_common.FfiResult.invalid_argument), result);
+}
+
+test "ffi: ls_netconf_alloc_with_result invalid options" {
+    const options = ls_alloc_driver_options().?;
+    defer ls_free_driver_options(options);
+
+    const o: *ffi_options.FFIOptions = @ptrCast(@alignCast(options));
+    // an out of range logger_level is not a valid logging.LogLevel byte, so converting
+    // this to netconf.Options (via `o.netconfOptions`) should fail with `InvalidArgument`.
+    o.logger_level = 255;
+
+    var result: u8 = 0;
+    const driver = ls_netconf_alloc_with_result("localhost", options, &result);
     try std.testing.expect(driver == null);
     try std.testing.expectEqual(@backingInt(ffi_common.FfiResult.invalid_argument), result);
 }

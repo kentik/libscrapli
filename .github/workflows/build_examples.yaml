@@ -24,6 +24,14 @@ jobs:
         uses: mlugg/setup-zig@v2
         with:
           version: ${{ env.ZIG_VERSION }}
+          # this job regenerates the (gitignored) openssl source tree from scratch on every
+          # run via `generate.sh`, so a zig cache persisted/restored across runs can end up
+          # referencing files that no longer exist on disk, causing zig's cache-manifest
+          # hit-check to hard fail with "failed to check cache: ... file_hash FileNotFound"
+          # instead of falling back to a normal cache miss/rebuild. disable cross-run caching
+          # here to avoid that; the cache is still reused within this job between this step
+          # and the "build the examples" step below.
+          use-cache: false
 
       - name: ensure openssl generate step cached
         run: |
