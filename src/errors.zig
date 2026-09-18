@@ -33,6 +33,9 @@ pub const ScrapliError = error{
 
     // for c library calls (file ops etc.) that fail w/ only a return code to show for it
     CError,
+
+    // for ffi boundary validation failures
+    InvalidArgument,
 };
 
 /// Wraps a critical error with additional logging info.

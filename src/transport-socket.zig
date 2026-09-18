@@ -173,29 +173,16 @@ fn handleConnectStreamCancel(
     }
 }
 
-// 192.0.2.0/24 is TEST-NET-1 (rfc5737) -- reserved for documentation, guaranteed unrouted, so
-// connects to it hang until something (us, hopefully!) gives up. so we can hopefully test as a
-// "unit" test basically.
-const blackhole_host = "192.0.2.1";
-const blackhole_port = 22;
-
-test "getStream: timeout" {
+test "handleConnectStreamCancel: timeout" {
     const io = std.testing.io;
-
-    const log = logging.Logger{
-        .allocator = std.testing.allocator,
-    };
 
     const start_time = std.Io.Timestamp.now(io, .awake);
 
-    const res = getStream(
+    const res = handleConnectStreamCancel(
         io,
-        log,
         null,
         start_time,
         2 * std.time.ns_per_s,
-        blackhole_host,
-        blackhole_port,
     );
 
     try std.testing.expectError(errors.ScrapliError.TimeoutExceeded, res);
@@ -209,25 +196,18 @@ test "getStream: timeout" {
     try std.testing.expect(elapsed_ns < 10 * std.time.ns_per_s);
 }
 
-test "getStream: cancellation" {
+test "handleConnectStreamCancel: cancellation" {
     const io = std.testing.io;
-
-    const log = logging.Logger{
-        .allocator = std.testing.allocator,
-    };
 
     const start_time = std.Io.Timestamp.now(io, .awake);
 
     var cancel = true;
 
-    const res = getStream(
+    const res = handleConnectStreamCancel(
         io,
-        log,
         &cancel,
         start_time,
         60 * std.time.ns_per_s,
-        blackhole_host,
-        blackhole_port,
     );
 
     try std.testing.expectError(errors.ScrapliError.Cancelled, res);

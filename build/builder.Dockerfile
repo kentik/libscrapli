@@ -13,11 +13,7 @@ RUN apt-get update -y && \
 RUN curl https://raw.githubusercontent.com/tristanisham/zvm/master/install.sh | bash
 RUN chmod +x /root/.zvm/self/zvm
 
-RUN case "${ZIG_VERSION:-}" in \
-      ""|*dev*) version=master ;; \
-      *)        version="$ZIG_VERSION" ;; \
-    esac && \
-    /root/.zvm/self/zvm i "$version"
+RUN test -n "${ZIG_VERSION:-}" && yes | /root/.zvm/self/zvm i "$ZIG_VERSION"
 
 FROM debian:bookworm-slim
 
