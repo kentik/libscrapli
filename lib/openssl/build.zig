@@ -4,7 +4,7 @@ pub fn build(b: *std.Build) !void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    _ = try std.process.run(
+    const generate_result = try std.process.run(
         b.allocator,
         b.graph.io,
         .{
@@ -12,6 +12,27 @@ pub fn build(b: *std.Build) !void {
             .argv = &[_][]const u8{"./generate.sh"},
         },
     );
+    defer b.allocator.free(generate_result.stdout);
+    defer b.allocator.free(generate_result.stderr);
+
+    switch (generate_result.term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.log.err(
+                    "generate.sh exited with code {d}\nstdout:\n{s}\nstderr:\n{s}",
+                    .{ code, generate_result.stdout, generate_result.stderr },
+                );
+                return error.OpenSSLGenerateFailed;
+            }
+        },
+        else => {
+            std.log.err(
+                "generate.sh terminated abnormally: {f}\nstdout:\n{s}\nstderr:\n{s}",
+                .{ generate_result.term, generate_result.stdout, generate_result.stderr },
+            );
+            return error.OpenSSLGenerateFailed;
+        },
+    }
 
     const crypto = libcrypto(b, target, optimize);
     crypto.installHeadersDirectory(
