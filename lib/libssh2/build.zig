@@ -12,6 +12,17 @@ pub fn build(b: *std.Build) void {
         },
     );
 
+    const ssl = openssl.artifact("ssl");
+    const crypto = openssl.artifact("crypto");
+
+    // openssl deliberately calls through mismatched fn pointers (lhash/doall etc.),
+    // which UBSan's function check traps on; nuke sanitizers. honestly fabio (fable) helped
+    // figure this out as im not 100% i understand, but i *do* understand that we hit traps related
+    // to ubsan w/out this unless in ReleaseFast which skipped some checks, now we can be in
+    // ReleaseSafe and w/ these flags we are gucci.
+    ssl.root_module.sanitize_c = .off;
+    crypto.root_module.sanitize_c = .off;
+
     const upstream = b.dependency(
         "libssh2",
         .{

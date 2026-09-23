@@ -98,7 +98,9 @@ pub fn main(init: std.process.Init) !void {
             // for a simple logger setup
             // .logger = logging.Logger{
             //     .allocator = allocator,
-            //     .f = logging.stdLogf,
+            //     .f = .{
+            //         .z = logging.stdLogf,
+            //      },
             // },
             .port = try getPort(init.environ_map),
             .auth = .{
@@ -125,7 +127,7 @@ pub fn main(init: std.process.Init) !void {
     );
     defer open_result.deinit();
 
-    const open_result_output = try open_result.getResult(allocator, .{});
+    const open_result_output = try open_result.getResult(allocator);
     defer allocator.free(open_result_output);
 
     std.debug.print(
@@ -146,7 +148,7 @@ pub fn main(init: std.process.Init) !void {
     );
     defer send_input_result.deinit();
 
-    const send_input_result_output = try send_input_result.getResult(allocator, .{});
+    const send_input_result_output = try send_input_result.getResult(allocator);
     defer allocator.free(send_input_result_output);
 
     std.debug.print(
