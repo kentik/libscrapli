@@ -61,3 +61,57 @@ test "once" {
     try std.testing.expectEqual(@as(usize, 1), test_once.call());
     try std.testing.expectEqual(@as(usize, 1), test_call_count);
 }
+
+// zlinter-disable no_global_vars
+var concurrent_test_call_count: usize = 0;
+var concurrent_test_once: Once(concurrentTestOnceFn) = .{};
+// zlinter-enable no_global_vars
+
+fn concurrentTestOnceFn() usize {
+    return @atomicRmw(usize, &concurrent_test_call_count, .Add, 1, .acq_rel) + 1;
+}
+
+fn concurrentOnceWorker(
+    once_ref: *Once(concurrentTestOnceFn),
+    start: *std.atomic.Value(bool),
+    out: *usize,
+) void {
+    while (!start.load(.acquire)) {
+        std.atomic.spinLoopHint();
+    }
+
+    out.* = once_ref.call();
+}
+
+test "once concurrent callers execute initializer once" {
+    concurrent_test_call_count = 0;
+    concurrent_test_once = .{};
+
+    var start = std.atomic.Value(bool).init(false);
+    var results: [16]usize = undefined;
+    var threads: [results.len]std.Thread = undefined;
+
+    for (0..results.len) |idx| {
+        threads[idx] = try std.Thread.spawn(
+            .{},
+            concurrentOnceWorker,
+            .{
+                &concurrent_test_once,
+                &start,
+                &results[idx],
+            },
+        );
+    }
+
+    start.store(true, .release);
+
+    for (threads) |thread| {
+        thread.join();
+    }
+
+    for (results) |result| {
+        try std.testing.expectEqual(@as(usize, 1), result);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), @atomicLoad(usize, &concurrent_test_call_count, .acquire));
+}

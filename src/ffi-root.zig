@@ -93,12 +93,15 @@ export fn ls_cli_alloc(
     const allocator = ffi_common.getAllocator();
 
     const o: *ffi_options.FFIOptions = @ptrCast(@alignCast(options_ptr));
+    const options = o.cliOptions(allocator) catch {
+        return null;
+    };
 
     const d = ffi_driver.FfiDriver.init(
         allocator,
         ffi_common.io,
         std.mem.span(host),
-        o.cliOptions(allocator),
+        options,
     ) catch {
         return null;
     };
@@ -120,12 +123,15 @@ export fn ls_netconf_alloc(
     const allocator = ffi_common.getAllocator();
 
     const o: *ffi_options.FFIOptions = @ptrCast(@alignCast(options_ptr));
+    const options = o.*.netconfOptions(allocator) catch {
+        return null;
+    };
 
     const d = ffi_driver.FfiDriver.initNetconf(
         allocator,
         ffi_common.io,
         std.mem.span(host),
-        o.*.netconfOptions(allocator),
+        options,
     ) catch {
         return null;
     };

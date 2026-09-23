@@ -5,6 +5,15 @@ const ffi_operations = @import("ffi-operations.zig");
 const mode = @import("cli-mode.zig");
 const operation = @import("cli-operation.zig");
 
+fn parseInputHandling(input_handling: u8) errors.ScrapliError!operation.InputHandling {
+    return switch (input_handling) {
+        0 => operation.InputHandling.exact,
+        1 => operation.InputHandling.fuzzy,
+        2 => operation.InputHandling.ignore,
+        else => errors.ScrapliError.InvalidArgument,
+    };
+}
+
 /// Return SendInputOptions from ffi provided arguments.
 pub fn sendInputOptionsFromArgs(
     allocator: std.mem.Allocator,
@@ -25,7 +34,7 @@ pub fn sendInputOptionsFromArgs(
     errdefer ffi_operations.freeOwnedStrings(allocator, options);
 
     if (input_handling) |inh| {
-        options.input_handling = @fromBackingInt(@intCast(inh.*));
+        options.input_handling = try parseInputHandling(inh.*);
     }
 
     const spanned_requested_mode = std.mem.span(requested_mode);
@@ -99,7 +108,7 @@ pub fn sendInputsOptionsFromArgs(
     errdefer ffi_operations.freeOwnedStrings(allocator, options);
 
     if (input_handling) |inh| {
-        options.input_handling = @fromBackingInt(@intCast(inh.*));
+        options.input_handling = try parseInputHandling(inh.*);
     }
 
     const spanned_requested_mode = std.mem.span(requested_mode);
@@ -149,7 +158,7 @@ pub fn sendPromptedInputOptionsFromArgs(
     options.abort_input = try allocator.dupe(u8, std.mem.span(abort_input));
 
     if (input_handling) |inh| {
-        options.input_handling = @fromBackingInt(@intCast(inh.*));
+        options.input_handling = try parseInputHandling(inh.*);
     }
 
     const spanned_requested_mode = std.mem.span(requested_mode);
@@ -164,4 +173,66 @@ pub fn sendPromptedInputOptionsFromArgs(
     }
 
     return options;
+}
+
+test "sendInputOptionsFromArgs invalid input_handling" {
+    var cancel = false;
+    var input_handling: u8 = 3;
+
+    try std.testing.expectError(
+        errors.ScrapliError.InvalidArgument,
+        sendInputOptionsFromArgs(
+            std.testing.allocator,
+            &cancel,
+            "show clock",
+            "",
+            &input_handling,
+            false,
+            false,
+        ),
+    );
+}
+
+test "sendInputsOptionsFromArgs invalid input_handling" {
+    var cancel = false;
+    var input_handling: u8 = 3;
+    const inputs = "show clock";
+    const input_lens = [_]u64{inputs.len};
+
+    try std.testing.expectError(
+        errors.ScrapliError.InvalidArgument,
+        sendInputsOptionsFromArgs(
+            std.testing.allocator,
+            &cancel,
+            inputs,
+            input_lens[0..],
+            "",
+            &input_handling,
+            false,
+            false,
+            false,
+        ),
+    );
+}
+
+test "sendPromptedInputOptionsFromArgs invalid input_handling" {
+    var cancel = false;
+    var input_handling: u8 = 3;
+
+    try std.testing.expectError(
+        errors.ScrapliError.InvalidArgument,
+        sendPromptedInputOptionsFromArgs(
+            std.testing.allocator,
+            &cancel,
+            "show clock",
+            "",
+            "",
+            "yes",
+            false,
+            "",
+            "",
+            &input_handling,
+            false,
+        ),
+    );
 }
