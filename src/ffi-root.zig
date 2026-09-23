@@ -82,8 +82,13 @@ export fn ls_free_driver_options(options_ptr: *ffi_common.LsOptions) callconv(.c
 export fn ls_cli_alloc(
     host: [*c]const u8,
     options_ptr: *ffi_common.LsOptions,
+    result_ptr: ?*u8,
 ) callconv(.c) ?*ffi_common.LsDriver {
     if (host == null) {
+        if (result_ptr) |r| {
+            r.* = @backingInt(ffi_common.FfiResult.invalid_argument);
+        }
+
         return null;
     }
 
@@ -93,7 +98,11 @@ export fn ls_cli_alloc(
     const allocator = ffi_common.getAllocator();
 
     const o: *ffi_options.FFIOptions = @ptrCast(@alignCast(options_ptr));
-    const options = o.cliOptions(allocator) catch {
+    const options = o.cliOptions(allocator) catch |err| {
+        if (result_ptr) |r| {
+            r.* = ffi_common.toFfiResult(err);
+        }
+
         return null;
     };
 
@@ -102,9 +111,17 @@ export fn ls_cli_alloc(
         ffi_common.io,
         std.mem.span(host),
         options,
-    ) catch {
+    ) catch |err| {
+        if (result_ptr) |r| {
+            r.* = ffi_common.toFfiResult(err);
+        }
+
         return null;
     };
+
+    if (result_ptr) |r| {
+        r.* = @backingInt(ffi_common.FfiResult.success);
+    }
 
     return @ptrCast(d);
 }
@@ -112,8 +129,13 @@ export fn ls_cli_alloc(
 export fn ls_netconf_alloc(
     host: [*c]const u8,
     options_ptr: *ffi_common.LsOptions,
+    result_ptr: ?*u8,
 ) callconv(.c) ?*ffi_common.LsDriver {
     if (host == null) {
+        if (result_ptr) |r| {
+            r.* = @backingInt(ffi_common.FfiResult.invalid_argument);
+        }
+
         return null;
     }
 
@@ -123,7 +145,11 @@ export fn ls_netconf_alloc(
     const allocator = ffi_common.getAllocator();
 
     const o: *ffi_options.FFIOptions = @ptrCast(@alignCast(options_ptr));
-    const options = o.*.netconfOptions(allocator) catch {
+    const options = o.*.netconfOptions(allocator) catch |err| {
+        if (result_ptr) |r| {
+            r.* = ffi_common.toFfiResult(err);
+        }
+
         return null;
     };
 
@@ -132,9 +158,17 @@ export fn ls_netconf_alloc(
         ffi_common.io,
         std.mem.span(host),
         options,
-    ) catch {
+    ) catch |err| {
+        if (result_ptr) |r| {
+            r.* = ffi_common.toFfiResult(err);
+        }
+
         return null;
     };
+
+    if (result_ptr) |r| {
+        r.* = @backingInt(ffi_common.FfiResult.success);
+    }
 
     return @ptrCast(d);
 }
@@ -301,16 +335,20 @@ test "ffi: ls_cli_alloc null host" {
     const options = ls_alloc_driver_options().?;
     defer ls_free_driver_options(options);
 
-    const driver = ls_cli_alloc(null, options);
+    var result: u8 = 0;
+    const driver = ls_cli_alloc(null, options, &result);
     try std.testing.expect(driver == null);
+    try std.testing.expectEqual(@backingInt(ffi_common.FfiResult.invalid_argument), result);
 }
 
 test "ffi: ls_netconf_alloc null host" {
     const options = ls_alloc_driver_options().?;
     defer ls_free_driver_options(options);
 
-    const driver = ls_netconf_alloc(null, options);
+    var result: u8 = 0;
+    const driver = ls_netconf_alloc(null, options, &result);
     try std.testing.expect(driver == null);
+    try std.testing.expectEqual(@backingInt(ffi_common.FfiResult.invalid_argument), result);
 }
 
 test "ffi: ls_session_write null buf" {

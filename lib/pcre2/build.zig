@@ -13,7 +13,7 @@ pub fn build(b: *std.Build) !void {
     // super janky, but lets us be decoupled from upstream (because even if we used upstream as
     // a dep and then tried to tweak it we would still be hosed if/until they update zig versions
     // and stuff).
-    _ = try std.process.run(
+    const generate_result = try std.process.run(
         b.allocator,
         b.graph.io,
         .{
@@ -21,6 +21,27 @@ pub fn build(b: *std.Build) !void {
             .argv = &[_][]const u8{"./generate.sh"},
         },
     );
+    defer b.allocator.free(generate_result.stdout);
+    defer b.allocator.free(generate_result.stderr);
+
+    switch (generate_result.term) {
+        .exited => |code| {
+            if (code != 0) {
+                std.log.err(
+                    "generate.sh exited with code {d}\nstdout:\n{s}\nstderr:\n{s}",
+                    .{ code, generate_result.stdout, generate_result.stderr },
+                );
+                return error.PCRE2GenerateFailed;
+            }
+        },
+        else => {
+            std.log.err(
+                "generate.sh terminated abnormally: {f}\nstdout:\n{s}\nstderr:\n{s}",
+                .{ generate_result.term, generate_result.stdout, generate_result.stderr },
+            );
+            return error.PCRE2GenerateFailed;
+        },
+    }
 
     const linkage = b.option(
         std.lang.LinkMode,
