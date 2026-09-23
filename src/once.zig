@@ -119,6 +119,7 @@ test "once concurrent callers execute initializer once" {
     for (threads) |thread| {
         thread.join();
     }
+    spawned = 0;
 
     for (results) |result| {
         try std.testing.expectEqual(@as(usize, 1), result);
