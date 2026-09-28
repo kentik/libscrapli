@@ -732,7 +732,6 @@ pub const FfiDriver = struct {
         operation_result: *[]u8,
         operation_result_lens: *[]u64,
         operation_result_failed_indicator: *[]u8,
-        operation_error: *[]u8,
     ) void {
         _ = self;
 
@@ -764,7 +763,19 @@ pub const FfiDriver = struct {
             );
         }
 
-        operation_error.* = "";
+        // NOTE: deliberately nothing is written to the caller's error buffer here. On the success
+        // path ls_cli_fetch_operation_sizes already reported an error size of zero, so the caller
+        // knows there is no error and never reads the buffer.
+        //
+        // This previously did `operation_error.* = "";`, which *assigned a zig slice* through the
+        // caller's pointer rather than copying into the buffer it points at. Callers hand us a
+        // pointer to their own slice/buffer header (go's []byte header is 24 bytes -- ptr/len/cap
+        // -- against zig's 16 byte ptr/len), so that assignment overwrote the caller's header with
+        // a pointer into *our* .rodata plus a length, planting a foreign pointer inside memory the
+        // caller's runtime owns and manages. It also zeroed the caller's length, which silently
+        // discarded every error message on the way back out. Everywhere else in the ffi layer
+        // (including the error paths here and in ffi-root-netconf.zig) we only ever `copyForwards`
+        // *into* caller owned buffers -- never assign over their headers. Keep it that way.
     }
 };
 

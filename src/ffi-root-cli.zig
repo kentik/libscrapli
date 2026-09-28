@@ -336,7 +336,6 @@ export fn ls_cli_fetch_operation(
             operation_result,
             operation_result_lens,
             operation_result_failed_indicator,
-            operation_error,
         );
     }
 
