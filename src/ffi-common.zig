@@ -44,8 +44,27 @@ pub fn getAllocator() std.mem.Allocator {
 // zlinter-disable no_global_vars
 var threaded: std.Io.Threaded = .init_single_threaded;
 
+const have_sig_io = std.posix.SIG != void and @hasField(std.posix.SIG, "IO");
+const have_sig_pipe = std.posix.SIG != void and @hasField(std.posix.SIG, "PIPE");
+
 fn initThreaded() void {
     threaded = .init(std.heap.c_allocator, .{});
+
+    if (std.posix.Sigaction != void) {
+        if (have_sig_io) setSignalHandlerOnStack(.IO);
+        if (have_sig_pipe) setSignalHandlerOnStack(.PIPE);
+    }
+}
+
+// std.Io.Threaded installs its SIGIO/SIGPIPE handlers without SA_ONSTACK; host runtimes (Go) with
+// small thread stacks require it, otherwise the kernel's signal frame overflows the interrupted
+// stack.
+fn setSignalHandlerOnStack(sig: std.posix.SIG) void {
+    var act: std.posix.Sigaction = undefined;
+    std.posix.sigaction(sig, null, &act);
+
+    act.flags |= std.posix.SA.ONSTACK;
+    std.posix.sigaction(sig, &act, null);
 }
 
 // zlinter-disable no_global_vars
