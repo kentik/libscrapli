@@ -449,6 +449,17 @@ test "ffi: ls_netconf_alloc_with_result invalid options" {
     try std.testing.expectEqual(@backingInt(ffi_common.FfiResult.invalid_argument), result);
 }
 
+test "ffi: initIo leaves signal handlers on the alternate signal stack" {
+    ffi_common.initIo();
+
+    for ([_]std.posix.SIG{ .IO, .PIPE }) |sig| {
+        var act: std.posix.Sigaction = undefined;
+        std.posix.sigaction(sig, null, &act);
+
+        try std.testing.expect(act.flags & std.posix.SA.ONSTACK != 0);
+    }
+}
+
 test "ffi: ls_session_write null buf" {
     const result = ls_session_write(@ptrFromInt(0xDEADBEEF), null, false);
 
