@@ -148,7 +148,7 @@ pub const Result = struct {
         }
 
         if (self.result_failure_match) |match| {
-            return match;
+            return if (match.len == 0) "failure pattern matched" else match;
         }
 
         return self.failed_indicators.?[@intCast(self.result_failure_indicator)];

@@ -843,6 +843,76 @@ fn waitForOperationResultForTests(
 // but nothing that requires a device/connection, and the cli driver has no close callbacks) -- we
 // should assert that the op is done, its not an error, and we dont leak anything. this is
 // basically happy path test.
+test "ffiFailurePatternsZeroWidth" {
+    const cases = [_]struct {
+        pattern: []const u8,
+        output: []const u8,
+    }{
+        .{ .pattern = "^$", .output = "" },
+        .{ .pattern = "\\A\\z", .output = "" },
+        .{ .pattern = "^(?=Error:)", .output = "Error: rejected" },
+    };
+
+    for (cases) |case| {
+        var definition = platform.Definition{
+            .prompt_pattern = "^.*#",
+            .default_mode = "cli",
+            .failure_patterns = &[_][]const u8{case.pattern},
+        };
+        const driver = try ffiDriverInitForTests(&definition);
+        defer driver.deinit();
+
+        const response = try driver.real_driver.cli.newResult(
+            std.testing.allocator,
+            .send_input,
+        );
+        defer response.deinit();
+
+        try response.record(.{
+            .rets = .{
+                try std.testing.allocator.dupe(u8, ""),
+                try std.testing.allocator.dupe(u8, case.output),
+            },
+        });
+
+        try std.testing.expect(response.result_failure_indicated);
+        try std.testing.expectEqualStrings("failure pattern matched", response.failureIndicator().?);
+        const sizes = driver.getCliResultLens(response);
+        try std.testing.expectEqual("failure pattern matched".len, sizes.operation_failure_indicator_size);
+
+        var start_time: u64 = 0;
+        var splits = [_]u64{0};
+        var input: []u8 = &.{};
+        var input_lens = [_]u64{0};
+        var raw: []u8 = &.{};
+        var raw_lens = [_]u64{0};
+        var output = try std.testing.allocator.alloc(u8, sizes.operation_result_size);
+        defer std.testing.allocator.free(output);
+        var output_lens = [_]u64{0};
+        var diagnostic = try std.testing.allocator.alloc(u8, sizes.operation_failure_indicator_size);
+        defer std.testing.allocator.free(diagnostic);
+        var splits_slice: []u64 = &splits;
+        var input_lens_slice: []u64 = &input_lens;
+        var raw_lens_slice: []u64 = &raw_lens;
+        var output_lens_slice: []u64 = &output_lens;
+
+        driver.getCliResults(
+            response,
+            &start_time,
+            &splits_slice,
+            &input,
+            &input_lens_slice,
+            &raw,
+            &raw_lens_slice,
+            &output,
+            &output_lens_slice,
+            &diagnostic,
+        );
+        try std.testing.expectEqualStrings("failure pattern matched", diagnostic);
+        try std.testing.expectEqualStrings(case.output, output);
+    }
+}
+
 test "ffiDriverOperationLifecycle" {
     var definition = platform.Definition{
         .prompt_pattern = "^.*[>#$]\\s?+$",
