@@ -3,9 +3,11 @@ const std = @import("std");
 const yaml = @import("yaml");
 
 const cli = @import("cli.zig");
+const errors = @import("errors.zig");
 const file = @import("file.zig");
 const mode = @import("cli-mode.zig");
 const operation = @import("cli-operation.zig");
+const re = @import("re.zig");
 const result = @import("cli-result.zig");
 const strings = @import("strings.zig");
 
@@ -308,6 +310,11 @@ pub const Definition = struct {
     default_mode: []const u8,
     modes: std.StringHashMapUnmanaged(*mode.Mode) = .empty,
     failure_indicators: ?[]const []const u8 = null,
+    // pcre2 patterns (multiline, caseless unless the pattern says otherwise via `(?-i)`) checked
+    // after failure_indicators; unlike indicators they can anchor, e.g. to the start of a line
+    failure_patterns: ?[]const []const u8 = null,
+    // compiled from failure_patterns by init, never set by callers
+    compiled_failure_patterns: ?[]*re.pcre2CompiledPattern = null,
     on_open_callback: ?OnXCallback = null,
     // nothing but yaml -> Definition should use bound callbacks, but if you did for some weird
     // reason, Definition expects a heap allocated struct that we will call deinit for (which
@@ -333,6 +340,8 @@ pub const Definition = struct {
         d.prompt_excludes = null;
         d.modes = .empty;
         d.failure_indicators = null;
+        d.failure_patterns = null;
+        d.compiled_failure_patterns = null;
         d.bound_on_open_callback = null;
         d.bound_on_close_callback = null;
         d.ntc_templates_platform = null;
@@ -364,6 +373,11 @@ pub const Definition = struct {
 
         if (options.failure_indicators) |failure_indicators| {
             d.failure_indicators = try dupeStringSlice(allocator, failure_indicators);
+        }
+
+        if (options.failure_patterns) |failure_patterns| {
+            d.failure_patterns = try dupeStringSlice(allocator, failure_patterns);
+            d.compiled_failure_patterns = try compileFailurePatterns(allocator, failure_patterns);
         }
 
         d.modes = options.modes;
@@ -398,6 +412,18 @@ pub const Definition = struct {
             freeStringSlice(allocator, failure_indicators);
         }
 
+        if (self.compiled_failure_patterns) |compiled_failure_patterns| {
+            for (compiled_failure_patterns) |p| {
+                re.pcre2Free(p);
+            }
+
+            allocator.free(compiled_failure_patterns);
+        }
+
+        if (self.failure_patterns) |failure_patterns| {
+            freeStringSlice(allocator, failure_patterns);
+        }
+
         if (self.bound_on_open_callback) |cb| {
             cb.deinit();
         }
@@ -416,6 +442,36 @@ pub const Definition = struct {
     }
 };
 
+fn compileFailurePatterns(
+    allocator: std.mem.Allocator,
+    patterns: []const []const u8,
+) ![]*re.pcre2CompiledPattern {
+    const compiled = try allocator.alloc(*re.pcre2CompiledPattern, patterns.len);
+    var compiled_count: usize = 0;
+
+    errdefer {
+        for (compiled[0..compiled_count]) |p| {
+            re.pcre2Free(p);
+        }
+
+        allocator.free(compiled);
+    }
+
+    for (patterns) |pattern| {
+        // empty patterns would match every result, and pcre2Compile cannot take them anyway
+        if (pattern.len == 0) {
+            return errors.ScrapliError.PatternError;
+        }
+
+        compiled[compiled_count] = re.pcre2Compile(pattern) orelse {
+            return errors.ScrapliError.PatternError;
+        };
+        compiled_count += 1;
+    }
+
+    return compiled;
+}
+
 /// YamlSource is a tagged union holding either the content or a filename of the yaml that will
 /// form a YamlDefinition.
 pub const YamlSource = union(enum) {
@@ -431,6 +487,7 @@ pub const YamlDefinition = struct {
     default_mode: []const u8,
     modes: []mode.Options,
     failure_indicators: ?[][]const u8,
+    failure_patterns: ?[][]const u8,
     on_open_instructions: ?[]BoundOnXCallbackInstruction,
     on_close_instructions: ?[]BoundOnXCallbackInstruction,
     force_in_session_auth: ?bool,
@@ -530,6 +587,7 @@ pub const YamlDefinition = struct {
                 .default_mode = parsed_definition.default_mode,
                 .modes = modes,
                 .failure_indicators = parsed_definition.failure_indicators,
+                .failure_patterns = parsed_definition.failure_patterns,
                 .bound_on_open_callback = on_open_callback,
                 .bound_on_close_callback = on_close_callback,
                 .force_in_session_auth = parsed_definition.force_in_session_auth orelse false,
@@ -560,6 +618,10 @@ fn definitionInitForAllocFailures(allocator: std.mem.Allocator) !void {
                 "% Invalid input",
                 "% Error",
             },
+            .failure_patterns = &[_][]const u8{
+                "(?-i)^Error:",
+                "^% Invalid",
+            },
             .ntc_templates_platform = "some_ntc_platform",
             .genie_platform = "some_genie_platform",
         },
@@ -574,4 +636,47 @@ test "definitionInitAllocationFailures" {
         definitionInitForAllocFailures,
         .{},
     );
+}
+
+test "yamlDefinitionFailurePatterns" {
+    var d = try YamlDefinition.toDefinition(
+        std.testing.allocator,
+        std.testing.io,
+        .{
+            .string =
+            \\---
+            \\prompt_pattern: '^.*#\s?$'
+            \\default_mode: 'exec'
+            \\modes:
+            \\  - name: 'exec'
+            \\    prompt_pattern: '^.*#\s?$'
+            \\failure_patterns:
+            \\  - '(?-i)^(Error|Parsing error):'
+            ,
+        },
+    );
+    defer d.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(1, d.failure_patterns.?.len);
+    try std.testing.expectEqual(1, d.compiled_failure_patterns.?.len);
+    try std.testing.expectEqual(null, d.failure_indicators);
+}
+
+test "definitionInitInvalidFailurePattern" {
+    for ([_][]const u8{ "(unclosed", "" }) |pattern| {
+        try std.testing.expectError(
+            errors.ScrapliError.PatternError,
+            Definition.init(
+                std.testing.allocator,
+                .{
+                    .prompt_pattern = "^some-prompt>\\s?$",
+                    .default_mode = mode.default_mode,
+                    .failure_patterns = &[_][]const u8{
+                        "^ok:",
+                        pattern,
+                    },
+                },
+            ),
+        );
+    }
 }

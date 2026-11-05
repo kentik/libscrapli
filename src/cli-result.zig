@@ -2,6 +2,7 @@ const std = @import("std");
 
 const bytes = @import("bytes.zig");
 const operation = @import("cli-operation.zig");
+const re = @import("re.zig");
 
 const result_join_delimiter = "\n";
 
@@ -16,6 +17,8 @@ pub const Result = struct {
     operation_kind: operation.Kind,
 
     failed_indicators: ?[]const []const u8,
+    // not owned, set by the driver from its definition; checked after failed_indicators
+    failure_patterns: ?[]const *re.pcre2CompiledPattern = null,
 
     inputs: std.ArrayList([]const u8),
 
@@ -28,8 +31,11 @@ pub const Result = struct {
     // set to true at first failure indication, further failures would not be captured
     result_failure_indicated: bool,
     // index of the given failed when contains list so we dont need to bother managing possible
-    // memory to hold the substring, < 0 means no failure
+    // memory to hold the substring, < 0 means no failure; failure pattern matches are offset by
+    // the failed_indicators length
     result_failure_indicator: i16,
+    // text a failure pattern matched, a slice of the matching entry in results
+    result_failure_match: ?[]const u8 = null,
 
     /// Initializes a heap allocated Result object, this object *does not own* the failed_indicators
     /// slice and will *not* free any of that memory!
@@ -104,24 +110,48 @@ pub const Result = struct {
 
         try self.results.append(self.allocator, data.rets[1]);
 
-        if (self.failed_indicators == null) {
-            return;
-        }
+        const indicators = self.failed_indicators orelse &[_][]const u8{};
+        const latest = self.results.items[self.results.items.len - 1];
 
-        for (0.., self.failed_indicators.?) |idx, failed_when| {
+        for (0.., indicators) |idx, failed_when| {
             if (std.mem.find(
                 u8,
-                self.results.items[self.results.items.len - 1],
+                latest,
                 failed_when,
             ) != null) {
                 self.result_failure_indicated = true;
                 self.result_failure_indicator = @intCast(idx);
+                self.result_failure_match = null;
 
                 // this can be slow if rets[1] is v large, and theres no reason continuing if we
                 // failed, so we are done here.
                 return;
             }
         }
+
+        for (0.., self.failure_patterns orelse &[_]*re.pcre2CompiledPattern{}) |idx, pattern| {
+            if (try re.pcre2Find(pattern, latest)) |match| {
+                self.result_failure_indicated = true;
+                self.result_failure_indicator = @intCast(indicators.len + idx);
+                self.result_failure_match = match;
+
+                return;
+            }
+        }
+    }
+
+    /// Returns the text that indicated failure -- the matched failure indicator, or the text a
+    /// failure pattern matched -- or null if no failure was indicated.
+    pub fn failureIndicator(self: *const Result) ?[]const u8 {
+        if (!self.result_failure_indicated) {
+            return null;
+        }
+
+        if (self.result_failure_match) |match| {
+            return if (match.len == 0) "failure pattern matched" else match;
+        }
+
+        return self.failed_indicators.?[@intCast(self.result_failure_indicator)];
     }
 
     /// Extends this Result object with the given result. Consumes the given Result.
@@ -138,6 +168,7 @@ pub const Result = struct {
             if (!self.result_failure_indicated and res.result_failure_indicated) {
                 self.result_failure_indicated = true;
                 self.result_failure_indicator = res.result_failure_indicator;
+                self.result_failure_match = res.result_failure_match;
             }
         }
 
@@ -457,4 +488,72 @@ test "getResult and getResultRaw join on newlines" {
     defer std.testing.allocator.free(actual_raw);
 
     try std.testing.expectEqualStrings("foo\nbar", actual_raw);
+}
+
+test "record failure patterns" {
+    const cases = [_]struct {
+        name: []const u8,
+        output: []const u8,
+        expected: ?[]const u8,
+    }{
+        .{
+            .name = "first line",
+            .output = "Parsing error: Unknown token 'foo'",
+            .expected = "Parsing error:",
+        },
+        .{
+            .name = "later line",
+            .output = "====\nError: Checkpoint '99' does not exist",
+            .expected = "Error:",
+        },
+        .{
+            .name = "inside a value",
+            .output = "{\n  \"description\": \"Parsing error: consult runbook\"\n}",
+            .expected = null,
+        },
+        .{
+            .name = "case sensitive via inline flag",
+            .output = "error: lowercase is not a cli error here",
+            .expected = null,
+        },
+        .{
+            .name = "indicator wins over pattern",
+            .output = "% Invalid input\nError: also here",
+            .expected = "% Invalid input",
+        },
+    };
+
+    const compiled = re.pcre2Compile("(?-i)^(Error|Parsing error):").?;
+    defer re.pcre2Free(compiled);
+
+    const patterns = [_]*re.pcre2CompiledPattern{compiled};
+
+    for (cases) |case| {
+        var res = try Result.init(
+            std.testing.allocator,
+            std.testing.io,
+            "localhost",
+            22,
+            operation.Kind.send_input,
+            &[_][]const u8{"% Invalid input"},
+        );
+        defer res.deinit();
+
+        res.failure_patterns = &patterns;
+
+        try res.record(
+            .{
+                .rets = [2][]const u8{
+                    try std.testing.allocator.dupe(u8, ""),
+                    try std.testing.allocator.dupe(u8, case.output),
+                },
+            },
+        );
+
+        if (case.expected) |expected| {
+            try std.testing.expectEqualStrings(expected, res.failureIndicator().?);
+        } else {
+            try std.testing.expectEqual(null, res.failureIndicator());
+        }
+    }
 }
