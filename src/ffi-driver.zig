@@ -707,9 +707,8 @@ pub const FfiDriver = struct {
             .operation_failure_indicator_size = 0,
         };
 
-        if (r.result_failure_indicator >= 0) {
-            const failure_size = r.failed_indicators.?[@intCast(r.result_failure_indicator)].len;
-            sizes.operation_failure_indicator_size = failure_size;
+        if (r.failureIndicator()) |failure_indicator| {
+            sizes.operation_failure_indicator_size = failure_indicator.len;
         }
 
         return sizes;
@@ -756,10 +755,10 @@ pub const FfiDriver = struct {
         r.packResultsRawJournal(operation_result_raw.*, operation_result_raw_lens.*);
         r.packResults(operation_result.*, operation_result_lens.*);
 
-        if (r.result_failure_indicated) {
+        if (r.failureIndicator()) |failure_indicator| {
             _ = bytes.ffiCopy(
                 operation_result_failed_indicator.*,
-                r.failed_indicators.?[@intCast(r.result_failure_indicator)],
+                failure_indicator,
             );
         }
 

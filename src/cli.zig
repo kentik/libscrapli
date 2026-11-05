@@ -203,7 +203,7 @@ pub const Driver = struct {
             .{@tagName(operation_kind)},
         );
 
-        return result.Result.init(
+        const res = try result.Result.init(
             allocator,
             self.io,
             self.host,
@@ -211,6 +211,9 @@ pub const Driver = struct {
             operation_kind,
             self.definition.failure_indicators,
         );
+        res.failure_patterns = self.definition.compiled_failure_patterns;
+
+        return res;
     }
 
     /// Open the cli connection.
