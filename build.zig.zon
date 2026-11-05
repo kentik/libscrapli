@@ -12,8 +12,7 @@
             .path = "lib/libssh2",
         },
         .yaml = .{
-            .url = "https://github.com/wrench1997/zig-yaml/archive/3875cce.tar.gz",
-            .hash = "zig_yaml-0.2.0-C1161hauAgBFlcbx-fkUitRmFXBeN1WjpiWU6S3dkyUR",
+            .path = "lib/zig-yaml",
         },
         .zlinter = .{
             .url = "https://github.com/kurtwagner/zlinter/archive/8696db5.tar.gz",
